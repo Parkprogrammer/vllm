@@ -406,6 +406,16 @@ class OpenAIServingChat(OpenAIServing):
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params,
                     )
+                    
+                    # TODO(jehyun): validation of additional prefix for QK-buffering
+                    if sampling_params.extra_args:
+                        if sampling_params.extra_args.get('kv_hook_capture') == '1':
+                            if not self.engine_client.vllm_config.cache_config.enable_attention_instrumentation:
+                                raise ValueError(
+                                    "Attention instrumentation requested but not enabled on server. "
+                                    "Start server with --enable-attention-instrumentation"
+                                )
+                    
                     validate_logits_processors_parameters(
                         self.logits_processors,
                         sampling_params,
@@ -1748,6 +1758,8 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            # NOTE(jehyun): For adding kv hook to response
+            kv_hook_data=final_res.kv_hook_data,
         )
 
         # Log complete response if output logging is enabled

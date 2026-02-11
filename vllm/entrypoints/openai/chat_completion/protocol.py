@@ -111,6 +111,12 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    
+    # NOTE(jehyun): For adding kv hook to response
+    kv_hook_data: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="List of KV hook attention data (one per layer)"
+    )
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -339,6 +345,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )
+    
+    # NOTE(jehyun): For adding kv hook to response
+    kv_hook_capture: int | None = Field(
+        default=None,
+        description="Enable KV hook attention capture (1=enable, 0=disable)"
+    )
+    kv_hook_layers: str | None = Field(
+        default=None, 
+        description="Comma-separated layer indices for KV hook (e.g., '0,5,11')"
+    )
 
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
@@ -483,6 +499,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+            
+        # NOTE(jehyun): For adding kv hook to response
+        if self.kv_hook_capture is not None:
+            extra_args["kv_hook_capture"] = str(self.kv_hook_capture)
+        if self.kv_hook_layers is not None:
+            extra_args["kv_hook_layers"] = self.kv_hook_layers
+            
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

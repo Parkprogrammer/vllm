@@ -427,6 +427,8 @@ class EngineArgs:
     )
     block_size: BlockSize | None = CacheConfig.block_size
     enable_prefix_caching: bool | None = None
+    enable_attention_instrumentation: bool = False          # NOTE(jehyun): Adding for creating placeholder for qk_buffer and snapshot
+    attention_instrumentation_layers: str | None = None     # and the targeted layers for the following logic. 
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -941,6 +943,15 @@ class EngineArgs:
                 "default": None,
             },
         )
+        # NOTE(jehyun): Adding CLI argument for vllm serving
+        cache_group.add_argument(
+            "--enable-attention-instrumentation", 
+            **cache_kwargs["enable_attention_instrumentation"]
+        )
+        cache_group.add_argument(
+            "--attention-instrumentation-layers",
+            **cache_kwargs["attention_instrumentation_layers"]
+        )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
@@ -1445,6 +1456,8 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            enable_attention_instrumentation=self.enable_attention_instrumentation,    # NOTE(jehyun): Adding field to CacheConfig return class,
+            attention_instrumentation_layers=self.attention_instrumentation_layers,    # and the targeted layers for the following logic. 
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,

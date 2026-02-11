@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# TODO(jehyun): Must add a much more simple prefix-way of getting output.
+import os
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -360,6 +362,33 @@ class RequestState:
         prompt_token_ids = self.prompt_token_ids
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
+            
+        # TODO(jehyun): Must add a much more simple prefix-way of getting output.
+        with open('/tmp/output_processor_debug.txt', 'a') as f:
+            f.write(f"[Output] req_id={external_req_id}, finished={finished}\n")
+            f.write(f"[Output] VLLM_KV_HOOK_ENABLED={os.environ.get('VLLM_KV_HOOK_ENABLED')}\n")
+            f.write(f"[Output] self.request_id={self.request_id}\n")
+        
+        # if os.environ.get('VLLM_KV_HOOK_ENABLED') == '1':
+        kv_hook_data = None
+        if finished:
+            
+            prefix = None
+            if self.parent_req and self.parent_req.sampling_params:
+                extra_args = self.parent_req.sampling_params.extra_args
+                if extra_args:
+                    prefix = extra_args.get('kv_hook_prefix')
+            from vllm.model_executor.layers.attention.kv_hook_utils import (
+                load_kv_snapshot_data,
+            )
+            with open('/tmp/output_processor_debug.txt', 'a') as f:
+                f.write(f"[Output] Calling load_kv_snapshot_data\n")
+            
+            # kv_hook_data = load_kv_snapshot_data(self.request_id) if finished else None
+            kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+
+            with open('/tmp/output_processor_debug.txt', 'a') as f:
+                f.write(f"[Output] Result: {kv_hook_data is not None}\n")
 
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
@@ -370,6 +399,7 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            kv_hook_data=kv_hook_data, # TODO(jehyun): Must add a much more simple prefix-way of getting output.
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
         )

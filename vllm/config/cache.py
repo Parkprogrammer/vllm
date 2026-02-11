@@ -75,6 +75,12 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    enable_attention_instrumentation: bool = False # NOTE(jehyun): Adding dataclass variable
+    """Enable Query/Key buffering and attention score capture for debugging and
+    analysis. This adds CPU memory overhead and should only be enabled when needed."""
+    attention_instrumentation_layers: str | None = None # NOTE(jehyun): Adding dataclass variable
+    """Comma-separated layer indices (e.g., "0,5,11") or "all". 
+    If None, defaults to the last layer only."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing. This is the
