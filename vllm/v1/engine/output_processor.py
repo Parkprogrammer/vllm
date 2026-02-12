@@ -372,20 +372,36 @@ class RequestState:
         # if os.environ.get('VLLM_KV_HOOK_ENABLED') == '1':
         kv_hook_data = None
         if finished:
-            
             prefix = None
+            extra_args = None
+            
             if self.parent_req and self.parent_req.sampling_params:
                 extra_args = self.parent_req.sampling_params.extra_args
-                if extra_args:
-                    prefix = extra_args.get('kv_hook_prefix')
+                if extra_args: prefix = extra_args.get('kv_hook_prefix')
+                
             from vllm.model_executor.layers.attention.kv_hook_utils import (
                 load_kv_snapshot_data,
             )
             with open('/tmp/output_processor_debug.txt', 'a') as f:
                 f.write(f"[Output] Calling load_kv_snapshot_data\n")
             
+            # Only wait when capture was requested for this request.
+            # Temp fix, do not check for loading snapshot since race condition could occur
+            capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
+            if True:
+                import time
+                limit = time.time() + 60.0
+                while True:
+                    kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+                    if kv_hook_data is not None: break
+                    if time.time() >= limit: break
+                    time.sleep(0.2)
+            else:
+                kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+                        
+            
             # kv_hook_data = load_kv_snapshot_data(self.request_id) if finished else None
-            kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+            # kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
 
             with open('/tmp/output_processor_debug.txt', 'a') as f:
                 f.write(f"[Output] Result: {kv_hook_data is not None}\n")

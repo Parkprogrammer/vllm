@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
