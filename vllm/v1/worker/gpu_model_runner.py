@@ -435,6 +435,9 @@ class GPUModelRunner(
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
 
+        # NOTE(jehyun): For the runner to have a hook for each thread
+        self.kv_hook = None
+
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -709,6 +712,12 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+
+        # NOTE(jehyun): Init for KV hook with global setter
+        if self.vllm_config.cache_config.enable_attention_instrumentation:
+            from vllm.model_executor.layers.attention.kv_hook_utils import KVHookConfig
+            layers_str = self.vllm_config.cache_config.attention_instrumentation_layers
+            self.init_kv_hook(KVHookConfig(enabled=True, layers_str=layers_str))
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -6254,6 +6263,14 @@ class GPUModelRunner(
                     stats = self.encoder_timing_registry[req_id]
                     stats.encoder_forward_time += per_request_time
                     stats.num_encoder_calls += 1
+
+    # NOTE(jehyun): For the runner to have a hook for each thread
+    def init_kv_hook(self, config) -> None:
+        """Initialize KV hook for attention instrumentation."""
+        from vllm.model_executor.layers.attention.kv_hook_utils import KVHook, set_kv_hook
+
+        self.kv_hook = KVHook(config)
+        set_kv_hook(self.kv_hook)
 
 
 @dataclass
