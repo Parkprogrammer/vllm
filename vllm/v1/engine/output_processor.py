@@ -365,22 +365,12 @@ class RequestState:
         # TODO(jehyun): Load KV hook snapshot data if request finished
         kv_hook_data = None
         if finished:
-            prefix = None
-            extra_args = None
-
-            if self.parent_req and self.parent_req.sampling_params:
-                extra_args = self.parent_req.sampling_params.extra_args
-                if extra_args:
-                    prefix = extra_args.get('kv_hook_prefix')
-
             from vllm.model_executor.layers.attention.kv_hook_utils import (
                 load_kv_snapshot_data,
             )
 
-            # Only load when capture was requested for this request
-            capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
-            if capture_on:
-                kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+            # Load snapshot data - extra_args will be extracted from snapshot file
+            kv_hook_data = load_kv_snapshot_data(self.request_id, prefix=None)
 
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally

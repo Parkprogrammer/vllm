@@ -38,11 +38,18 @@ def load_kv_snapshot_data(req_id: str, prefix: str | None = None) -> list[dict[s
     try:
         req_id_safe = req_id.replace('-', '_')
         pattern = f"/tmp/vllm_snapshot_{req_id_safe}_*.pt"
-        
+
         # NOTE(jehyun): Simplified wait logic - just wait for files to be written
         time.sleep(0.5)  # Give time for all files to be written
         files = glob.glob(pattern)
         if not files: return None
+
+        # Check first file to see if capture was requested
+        first_data = torch.load(files[0])
+        extra_args = first_data.get('extra_args')
+        capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
+        if not capture_on:
+            return None
 
         results, loaded_files = [], [] # Track successfully loaded files
         files.sort()
@@ -540,12 +547,18 @@ class KVHook:
                         block_size=block_size,
                     )
 
+                    # Store extra_args for output_processor to access
+                    extra_args = None
+                    if req_state.sampling_params and req_state.sampling_params.extra_args:
+                        extra_args = req_state.sampling_params.extra_args
+
                     self.snapshots[req_id] = {
                         'layer_idx': layer_idx,
                         'keys': k_tensor,
                         'queries': q_tensor,
                         'attn_scores': attn_scores,
                         'token_meta': token_meta,
+                        'extra_args': extra_args,  # Store for output_processor
                     }
 
                     save_path = f"/tmp/vllm_snapshot_{req_id.replace('-', '_')}_layer{layer_idx}_T{min_len}.pt"

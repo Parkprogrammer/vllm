@@ -488,10 +488,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["kv_transfer_params"] = self.kv_transfer_params
 
         # NOTE(jehyun): For adding kv hook to response
+        with open('/tmp/vllm_protocol_debug.log', 'a') as f:
+            f.write(f"[Protocol] kv_hook_capture={self.kv_hook_capture}, kv_hook_layers={self.kv_hook_layers}\n")
         if self.kv_hook_capture is not None:
             extra_args["kv_hook_capture"] = str(self.kv_hook_capture)
         if self.kv_hook_layers is not None:
             extra_args["kv_hook_layers"] = self.kv_hook_layers
+        with open('/tmp/vllm_protocol_debug.log', 'a') as f:
+            f.write(f"[Protocol] extra_args={extra_args}\n")
 
         return SamplingParams.from_optional(
             n=self.n,
