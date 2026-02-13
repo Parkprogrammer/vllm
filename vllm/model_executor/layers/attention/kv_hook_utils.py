@@ -39,15 +39,36 @@ def load_kv_snapshot_data(req_id: str, prefix: str | None = None) -> list[dict[s
         req_id_safe = req_id.replace('-', '_')
         pattern = f"/tmp/vllm_snapshot_{req_id_safe}_*.pt"
 
-        # NOTE(jehyun): Simplified wait logic - just wait for files to be written
-        time.sleep(0.5)  # Give time for all files to be written
-        files = glob.glob(pattern)
+        # NOTE(jehyun): Wait for snapshot files to be written
+        # The snapshot is written asynchronously by the model runner
+        # QK computation is done on CPU which can take significant time
+        max_wait = 60.0  # Maximum wait time in seconds
+        wait_interval = 0.2
+        elapsed = 0.0
+        files = []
+
+        while elapsed < max_wait:
+            files = glob.glob(pattern)
+            if files:
+                break
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+
+        # DEBUG: Log what we found
+        with open('/tmp/vllm_load_log.txt', 'a') as f:
+            f.write(f"[Load] req_id={req_id}, pattern={pattern}\n")
+            f.write(f"[Load] files found: {files}\n")
+
         if not files: return None
 
         # Check first file to see if capture was requested
         first_data = torch.load(files[0])
         extra_args = first_data.get('extra_args')
         capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
+
+        with open('/tmp/vllm_load_log.txt', 'a') as f:
+            f.write(f"[Load] extra_args={extra_args}, capture_on={capture_on}\n")
+
         if not capture_on:
             return None
 
