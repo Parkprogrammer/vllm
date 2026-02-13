@@ -256,6 +256,9 @@ class Attention(nn.Module, AttentionLayerBase):
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
 
+        # NOTE(jehyun): Passing on hook for each layer
+        self.kv_hook = None
+
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
         self.use_mm_prefix = model_config is not None and model_config.is_mm_prefix_lm
@@ -692,6 +695,18 @@ def unified_attention_with_output(
     # attention forward.
     del kv_cache_dummy_dep
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
+
+    # NOTE(jehyun): Adding function-call
+    from vllm.model_executor.layers.attention.kv_hook_utils import get_kv_hook
+    kv_hook = get_kv_hook()
+
+    if kv_hook and kv_hook.config.enabled and kv_hook.runtime_enabled_this_step:
+        kv_hook.buffer_qk_pair(
+            query=query,
+            key=key,
+            attn_metadata=attn_metadata,
+            layer_name=layer_name,
+        )
 
     self.impl.forward(
         self,
