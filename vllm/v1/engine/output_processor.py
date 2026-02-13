@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# TODO(jehyun): Must add a much more simple prefix-way of getting output.
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -361,6 +362,26 @@ class RequestState:
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
 
+        # TODO(jehyun): Load KV hook snapshot data if request finished
+        kv_hook_data = None
+        if finished:
+            prefix = None
+            extra_args = None
+
+            if self.parent_req and self.parent_req.sampling_params:
+                extra_args = self.parent_req.sampling_params.extra_args
+                if extra_args:
+                    prefix = extra_args.get('kv_hook_prefix')
+
+            from vllm.model_executor.layers.attention.kv_hook_utils import (
+                load_kv_snapshot_data,
+            )
+
+            # Only load when capture was requested for this request
+            capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
+            if capture_on:
+                kv_hook_data = load_kv_snapshot_data(self.request_id, prefix)
+
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
             lora_request=self.lora_request,
@@ -370,6 +391,7 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            kv_hook_data=kv_hook_data,  # TODO(jehyun): Must add a much more simple prefix-way of getting output.
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
         )
