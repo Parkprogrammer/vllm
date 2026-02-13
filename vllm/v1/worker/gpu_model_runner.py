@@ -715,9 +715,24 @@ class GPUModelRunner(
 
         # NOTE(jehyun): Init for KV hook with global setter
         if self.vllm_config.cache_config.enable_attention_instrumentation:
-            from vllm.model_executor.layers.attention.kv_hook_utils import KVHookConfig
+            from vllm.model_executor.layers.attention.kv_hook_utils import HookConfig
             layers_str = self.vllm_config.cache_config.attention_instrumentation_layers
-            self.init_kv_hook(KVHookConfig(enabled=True, layers_str=layers_str))
+
+            # Get num_layers (handle both text-only and multimodal models)
+            hf_config = self.vllm_config.model_config.hf_config
+            num_layers = getattr(hf_config, 'num_hidden_layers',
+                               getattr(hf_config, 'text_config', hf_config).num_hidden_layers)
+
+            # Parse layers_str to get target layer indices
+            if layers_str and layers_str.lower() != "all":
+                layers = set(int(x.strip()) for x in layers_str.split(','))
+            else:
+                layers = set(range(num_layers))
+
+            config = HookConfig(enabled=True, layers=layers, topk=10)
+            with open('/tmp/vllm_init_debug.log', 'w') as f:
+                f.write(f"init_kv_hook called with config={config}\n")
+            self.init_kv_hook(config)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -892,6 +907,34 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+
+            # NOTE(jehyun): Snapshot KV hook data before removing request
+            if self.kv_hook and self.kv_hook.config.enabled:
+                req_state = self.requests.get(req_id)
+                if req_state:
+                    # Check if should capture & get prefix
+                    should_capture = False
+                    prefix = None
+                    if req_state.sampling_params:
+                        extra_args = req_state.sampling_params.extra_args
+                        if extra_args:
+                            should_capture = str(extra_args.get('kv_hook_capture', '1')) == '1'
+                            with open('/tmp/vllm_snapshot_debug.log', 'a') as f:
+                                f.write(f"req_id={req_id}, should_capture={should_capture}, prefix={prefix}\n")
+                            prefix = extra_args.get('kv_hook_prefix')
+
+                    if should_capture:
+                        try:
+                            self.kv_hook.snapshot_keys_immediate(
+                                req_state=req_state,
+                                block_size=self.cache_config.block_size,
+                                kv_caches=self.kv_caches,
+                                prefix=prefix,
+                            )
+                        except Exception as e:
+                            with open('/tmp/vllm_snapshot_debug.log', 'a') as f:
+                                f.write(f"Snapshot failed for {req_id}: {e}\n")
+
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -3348,6 +3391,21 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # NOTE(jehyun): Tracing snapshot/buffering settings
+            if self.kv_hook:
+                capture_needed = False
+
+                for req_id in self.input_batch.req_ids:
+                    req_state = self.requests.get(req_id)
+                    if req_state and req_state.sampling_params:
+                        extra_args = req_state.sampling_params.extra_args
+                        if extra_args and str(extra_args.get('kv_hook_capture', '0')) == '1':
+                            # Setting capture logic differently for each request by the client
+                            capture_needed = True
+                            break
+
+                self.kv_hook.runtime_enabled_this_step = capture_needed
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
