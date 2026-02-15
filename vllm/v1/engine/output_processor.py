@@ -556,8 +556,10 @@ class OutputProcessor:
             self.parent_requests[parent_req.request_id] = parent_req
 
         # Track KV hook capture requests
+        # NOTE: extra_args stores kv_hook_capture as str ("0" or "1"),
+        # so we must compare explicitly — "0" is truthy in Python.
         sp = request.sampling_params
-        if sp and sp.extra_args and sp.extra_args.get('kv_hook_capture'):
+        if sp and sp.extra_args and str(sp.extra_args.get('kv_hook_capture', '0')) == '1':
             req_state.kv_hook_capture = True
 
         # Track the external_req_id -> [internal_req_id, ...] mapping

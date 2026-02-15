@@ -163,6 +163,11 @@ class KVHook:
 
         # For tracing snapshot, buffering logic on/off for each batch step
         self.runtime_enabled_this_step = False
+        # Per-step set of slot IDs belonging to capture-enabled requests.
+        # Only these slots are buffered in buffer_query() to avoid wasting
+        # memory on non-capture requests and to prevent stale cross-request
+        # data when blocks are reallocated.
+        self.capture_slots: Optional[Set[int]] = None
 
     def buffer_query(self, query: torch.Tensor, key: torch.Tensor, attn_metadata, layer_name: str) -> None:
         """Buffer Query tokens at attention-computation time.
@@ -185,10 +190,14 @@ class KVHook:
         except Exception:
             return
 
+        capture_slots = self.capture_slots
         for i in range(query.shape[0]):
 
             slot_id = slot_ids[i].item()
             if slot_id < 0: continue
+            # Only buffer slots belonging to capture-enabled requests
+            if capture_slots is not None and slot_id not in capture_slots:
+                continue
 
             buffer_key = (layer_idx, slot_id)
             if buffer_key not in self.q_buffer: self.q_buffer[buffer_key] = []
@@ -446,8 +455,30 @@ class KVHook:
                 _shm_write(req_id, _req_snapshots)
 
         except Exception:
-            pass
-            
+            import logging
+            logging.getLogger(__name__).warning(
+                "Capturing attention failed for %s", req_id, exc_info=True)
+
+    def cleanup_request_buffers(
+        self, block_ids: list[list[int]], block_size: int,
+    ) -> None:
+        """Remove buffered Q vectors for a finished request.
+
+        Must be called for ALL finished requests (regardless of capture flag)
+        to prevent stale Q data from leaking into future requests that reuse
+        the same KV cache blocks.
+        """
+        if not self.q_buffer or not block_ids:
+            return
+        slots_to_remove: Set[int] = set()
+        for block_list in block_ids:
+            for bid in block_list:
+                for off in range(block_size):
+                    slots_to_remove.add(bid * block_size + off)
+        keys_to_remove = [k for k in self.q_buffer if k[1] in slots_to_remove]
+        for k in keys_to_remove:
+            del self.q_buffer[k]
+
     def _extract_layer_idx(self, layer_name: str) -> int:
         
         # cache name

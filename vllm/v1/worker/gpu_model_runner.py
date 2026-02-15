@@ -932,6 +932,12 @@ class GPUModelRunner(
                                 "Capturing attention failed for %s",
                                 req_id, exc_info=True)
 
+                    # Always clean up Q buffer for finished requests
+                    # (regardless of capture flag) to prevent stale data
+                    # when KV cache blocks are reallocated to new requests.
+                    self.kv_hook.cleanup_request_buffers(
+                        req_state.block_ids, self.cache_config.block_size)
+
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -3390,19 +3396,27 @@ class GPUModelRunner(
             self._update_states(scheduler_output)
 
             # NOTE(jehyun): Tracing snapshot/buffering settings
+            # Build per-request capture_slots so buffer_query only stores Q
+            # for capture-enabled requests, preventing cross-request leakage
+            # when KV cache blocks are later reallocated.
             if self.kv_hook:
-                capture_needed = False
+                capture_slots: set[int] | None = None
+                block_size = self.cache_config.block_size
 
                 for req_id in self.input_batch.req_ids:
                     req_state = self.requests.get(req_id)
                     if req_state and req_state.sampling_params:
                         extra_args = req_state.sampling_params.extra_args
                         if extra_args and str(extra_args.get('kv_hook_capture', '0')) == '1':
-                            # Setting capture logic differently for each request by the client
-                            capture_needed = True
-                            break
+                            if capture_slots is None:
+                                capture_slots = set()
+                            for block_list in req_state.block_ids:
+                                for bid in block_list:
+                                    for off in range(block_size):
+                                        capture_slots.add(bid * block_size + off)
 
-                self.kv_hook.runtime_enabled_this_step = capture_needed
+                self.kv_hook.runtime_enabled_this_step = capture_slots is not None
+                self.kv_hook.capture_slots = capture_slots
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
