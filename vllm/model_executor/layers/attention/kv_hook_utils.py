@@ -12,6 +12,45 @@ import os, re, glob, time
 import gzip, base64
 import torch
 
+def extract_k_from_kv_cache(
+    kv_cache: torch.Tensor,
+    slot_ids: list[int],
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Extract K vectors from paged KV cache at given slot positions.
+
+    Backend-agnostic: auto-detects layout from tensor shape.
+      - FlashInfer:    [num_blocks, 2, page_size, num_kv_heads, head_dim]
+      - FlashAttention:[2, num_blocks, page_size, num_kv_heads, head_dim]
+
+    Returns: Tensor of shape [len(slot_ids), num_kv_heads, head_dim]
+    """
+    shape = kv_cache.shape
+    slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=kv_cache.device)
+
+    if kv_cache.ndim == 5 and shape[0] == 2:
+        # FlashAttention layout: [2(K/V), num_blocks, page_size, ...]
+        page_size = shape[2]
+        num_slots = shape[1] * page_size
+        k_flat = kv_cache[0].reshape(num_slots, -1)          # [total_slots, kv_heads*head_dim]
+        k = k_flat[slot_tensor].view(len(slot_ids), shape[3], shape[4])
+    elif kv_cache.ndim == 5 and shape[1] == 2:
+        # FlashInfer layout: [num_blocks, 2(K/V), page_size, ...]
+        page_size = shape[2]
+        page_indices = slot_tensor // page_size
+        page_offsets = slot_tensor % page_size
+        k = kv_cache[page_indices, 0, page_offsets]           # [T, kv_heads, head_dim]
+    elif kv_cache.ndim == 3 and shape[0] == 2:
+        # Simple layout: [2, total_slots, hidden]
+        k = kv_cache[0, slot_tensor]
+    else:
+        raise ValueError(
+            f"Unsupported KV cache layout: ndim={kv_cache.ndim} shape={list(shape)}"
+        )
+
+    return k.cpu().to(dtype)
+
+
 _LAYER_PATTERNS = [
     re.compile(r"(?:^|\.)(?:layers)\.(\d+)(?:\.|$)"),
     re.compile(r"(?:^|\.)(?:h)\.(\d+)(?:\.|$)"),
@@ -501,6 +540,39 @@ class KVHook:
                     f.write(f"[Snapshot] q_list: {len(q_list)}, k_list: {len(k_list)}\n")
             
                 
+                # ============================================================
+                # TEST: Read K directly from KV cache and compare with buffer
+                # ============================================================
+                try:
+                    if kv_caches and ordered_slots and k_list:
+                        kv_cache_idx = layer_idx if layer_idx < len(kv_caches) else matching_group_idx
+                        if kv_cache_idx is not None and kv_cache_idx < len(kv_caches):
+                            k_from_cache = extract_k_from_kv_cache(
+                                kv_caches[kv_cache_idx], ordered_slots
+                            )
+                            k_buffered = torch.stack(k_list)
+                            cmp_len = min(k_from_cache.shape[0], k_buffered.shape[0])
+                            kc, kb = k_from_cache[:cmp_len], k_buffered[:cmp_len]
+                            max_diff = (kc.float() - kb.float()).abs().max().item()
+                            cos_sim = torch.nn.functional.cosine_similarity(
+                                kc.float().reshape(-1).unsqueeze(0),
+                                kb.float().reshape(-1).unsqueeze(0),
+                            ).item()
+                            status = "PASS" if max_diff < 0.01 else "FAIL"
+                            with open('/tmp/vllm_kv_cache_read_test.log', 'a') as f:
+                                f.write(
+                                    f"[KV_READ_TEST] req={req_id} layer={layer_idx} "
+                                    f"cache_shape={list(kv_caches[kv_cache_idx].shape)} "
+                                    f"tokens={cmp_len} max_diff={max_diff:.8f} "
+                                    f"cos_sim={cos_sim:.8f} {status}\n"
+                                )
+                except Exception as e:
+                    with open('/tmp/vllm_kv_cache_read_test.log', 'a') as f:
+                        f.write(f"[KV_READ_TEST] EXCEPTION req={req_id} layer={layer_idx}: {e}\n")
+                        import traceback
+                        f.write(traceback.format_exc() + "\n")
+                # ============================================================
+
                 if q_list and k_list:
 
                     q0, k0 = q_list[0], k_list[0]
