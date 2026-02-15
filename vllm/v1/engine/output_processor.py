@@ -368,7 +368,7 @@ class RequestState:
             from vllm.model_executor.layers.attention.kv_hook_utils import (
                 load_kv_snapshot_data,
             )
-            kv_hook_data = load_kv_snapshot_data(self.request_id, prefix=None)
+            kv_hook_data = load_kv_snapshot_data(self.request_id)
 
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally

@@ -35,7 +35,7 @@ def test_load_kv_snapshot_data_round_trip_and_cleanup():
     torch.save(payload, path)
     assert os.path.exists(path)
 
-    out = load_kv_snapshot_data(req_id, prefix=None)
+    out = load_kv_snapshot_data(req_id)
     assert out is not None
     assert len(out) == 1
     item = out[0]
@@ -62,7 +62,7 @@ def test_load_kv_snapshot_data_returns_none_when_capture_off():
         path,
     )
     try:
-        out = load_kv_snapshot_data(req_id, prefix=None)
+        out = load_kv_snapshot_data(req_id)
         assert out is None
         # capture off path exits early and keeps file untouched.
         assert os.path.exists(path)
@@ -72,7 +72,7 @@ def test_load_kv_snapshot_data_returns_none_when_capture_off():
 
 
 def test_build_token_meta_contains_diagnostics():
-    hook = KVHook(HookConfig(enabled=True, layers={33}, topk=10))
+    hook = KVHook(HookConfig(enabled=True, layers={33}))
     req_state = SimpleNamespace(
         num_prompt_tokens=8,
         num_tokens=20,
@@ -98,7 +98,7 @@ def test_build_token_meta_contains_diagnostics():
 
 
 def test_buffer_query_uses_layer_and_slot_mapping():
-    hook = KVHook(HookConfig(enabled=True, layers={33}, topk=10))
+    hook = KVHook(HookConfig(enabled=True, layers={33}))
     query = torch.randn(3, 2, 4, dtype=torch.float32)
     key = torch.randn(3, 2, 4, dtype=torch.float32)
     attn_metadata = SimpleNamespace(slot_mapping=torch.tensor([10, -1, 12], dtype=torch.int64))

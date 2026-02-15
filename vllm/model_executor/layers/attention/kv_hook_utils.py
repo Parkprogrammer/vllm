@@ -133,22 +133,15 @@ def get_kv_hook() -> Optional['KVHook']:
     """Get the global KV hook instance"""
     return _kv_hook
 
-def load_kv_snapshot_data(req_id: str, prefix: str | None = None) -> list[dict[str, Any]] | None:
-    """Load KV snapshot(s) via shared memory (cross-process, no disk I/O).
-
-    The worker process writes snapshots to a named shared-memory segment.
-    This function polls briefly until the segment appears (typically < 100ms).
-    """
+def load_kv_snapshot_data(req_id: str) -> list[dict[str, Any]] | None:
+    """Load KV snapshot(s) via shared memory (cross-process, no disk I/O)."""
     return _shm_read(req_id, timeout=5.0)
 
 @dataclass
 class HookConfig:
     """Configuration for KV Cache hook"""
     enabled: bool = False
-    prefix: Optional[str] = None # Output path prefix
     layers: Set[int] = None
-    heads: Optional[Set[int]] = None  # Head indices (None = all)
-    topk: Optional[int] = None  # Top-k values per (token, head)
 
 class KVHook:
     """Per-worker KV hook for post-hoc attn_score and other utilities.
@@ -203,40 +196,6 @@ class KVHook:
             q_token = query_cpu[i].to(torch.float16) if query_cpu[i].dtype != torch.float16 else query_cpu[i]
             self.q_buffer[buffer_key].append(q_token)
     
-    # May not support Multi-Model, Head-permutation
-    # _compute_ordered_slots_from_request
-    def slot_from_request(self, req_state, block_size: int) -> list[int]:
-        """Compute ordered slot IDs used by this request from block_ids."""
-        
-        ordered_slots: list[int] = []
-        if not req_state.block_ids: return ordered_slots
-        num_tokens = req_state.num_tokens
-        
-        # block_ids is tuple[list[int], ...] - flatten all block lists
-        all_blocks = []
-        for block_list in req_state.block_ids: all_blocks.extend(block_list)
-
-        # Compute slot IDs in token order: slot_id = block_id * block_size + offset
-        # Dedup slots just in case
-        tokens_processed = 0
-        seen_slots: set[int] = set()
-        for block_id in all_blocks:
-            # TODO(jehyun): Need more error-handling here. But moving on for now.
-            if tokens_processed >= num_tokens: break
-
-            start_slot = block_id * block_size
-            tokens_in_this_block = min(block_size, num_tokens - tokens_processed)
-
-            for offset in range(tokens_in_this_block):
-                slot_id = start_slot + offset
-                if slot_id in seen_slots: continue
-                ordered_slots.append(slot_id)
-                seen_slots.add(slot_id)
-
-            tokens_processed += tokens_in_this_block
-
-        return ordered_slots
-
     def build_token_meta(
         self,
         req_state,
@@ -296,7 +255,7 @@ class KVHook:
 
         return {
             "token_idx": [int(i) for i in token_idx],
-            "prompt_len": prompt_len,
+            "prompt_len": prompt_len, 
             "total_len": total_len,
             "vision_ranges": vision_ranges,
             "language_ranges": language_ranges,
@@ -319,19 +278,15 @@ class KVHook:
         # Always create a mapping index from hk to hq
         if hk == hq:
             k_m = k
-            mode = "same_heads"
         elif hk < hq and (hq % hk == 0):
-            # Standard GQA grouping: head group size = hq//hk
-            r = hq // hk
-            idx = (torch.arange(hq, device=k.device) // r)  # Mapping to 0..hk-1
-            k_m = k.index_select(0, idx)
-            mode = f"GQA_r={r}"
+            # GQA: expand K heads to match Q heads
+            k_m = k.index_select(0, torch.arange(hq, device=k.device) // (hq // hk))
         else:
-            # Otherwise (including hk>hq), linear resample: select hq from 0..hk-1
-            idx = torch.floor(torch.arange(hq, device=k.device) * (hk / hq)).long()
-            idx = torch.clamp(idx, 0, hk - 1)
+            # Fallback: linear resample
+            idx = torch.clamp(
+                torch.floor(torch.arange(hq, device=k.device) * (hk / hq)).long(),
+                0, hk - 1)
             k_m = k.index_select(0, idx)
-            mode = f"resample_hq={hq}_hk={hk}"
 
         scores = torch.bmm(q, k_m.transpose(-2, -1)) * scale
         probs = torch.softmax(scores, dim=-1)
@@ -357,11 +312,7 @@ class KVHook:
 
             _req_snapshots: list[dict] = []  # collect per-layer results
 
-            # for layer_idx in self.config.layers:
-            # Original logic: iterate over target_layers instead of self.config.layers
-            for layer_idx in target_layers:  # ← Changed from self.config.layers
-
-                # Debug: Log actual buffer slot_ids for this layer
+            for layer_idx in target_layers:
                 buffer_slots_this_layer = [slot_id for (l_idx, slot_id) in self.q_buffer.keys() if l_idx == layer_idx]
 
                 if not buffer_slots_this_layer: continue
@@ -410,11 +361,7 @@ class KVHook:
                 token_idx: list[int] = []
                 q_slot_ids: list[int] = []
 
-                # NOTE(jehyun): Build a mapping from slot_id to absolute token position
-                # For multi-modal requests, ordered_slots may not start from 0
-                # We need to find the actual token index based on slot position
                 if not ordered_slots: continue
-                min_slot = min(ordered_slots)
 
                 # Collect Q from buffer in deterministic token order.
                 for slot_idx, slot_id in enumerate(ordered_slots):
@@ -477,8 +424,7 @@ class KVHook:
                     token_meta = self.build_token_meta(
                         req_state,
                         token_idx,
-                        ordered_slots_len=len(ordered_slots),
-                    )
+                        ordered_slots_len=len(ordered_slots), )
 
                     # Encode to wire format and collect for shared memory
                     attn_scores = attn_scores.cpu()
@@ -494,8 +440,6 @@ class KVHook:
                     # Clean up this request's Q slots from buffer
                     for slot_id in request_slot_set:
                         self.q_buffer.pop((layer_idx, slot_id), None)
-
-                    # break
 
             # Write all collected layer snapshots to shared memory at once
             if _req_snapshots:

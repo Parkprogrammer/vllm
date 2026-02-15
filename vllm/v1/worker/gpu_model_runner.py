@@ -729,7 +729,7 @@ class GPUModelRunner(
             else:
                 layers = set(range(num_layers))
 
-            config = HookConfig(enabled=True, layers=layers, topk=10)
+            config = HookConfig(enabled=True, layers=layers)
             self.init_kv_hook(config)
 
     def update_max_model_len(self, max_model_len: int) -> None:
