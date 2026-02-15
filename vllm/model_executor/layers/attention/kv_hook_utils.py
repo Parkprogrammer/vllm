@@ -8,9 +8,44 @@ from dataclasses import dataclass
 from bisect import bisect_left
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-import os, re, glob, time
+import re, time, struct, pickle
 import gzip, base64
 import torch
+from multiprocessing import shared_memory
+
+def _shm_name(req_id: str) -> str:
+    """Deterministic shared-memory segment name from request ID."""
+    return "/vkv_" + req_id.replace("-", "")[:40]
+
+
+def _shm_write(req_id: str, snapshots: list[dict]) -> None:
+    """Write snapshot list to a named shared-memory segment."""
+    payload = pickle.dumps(snapshots)
+    size = len(payload)
+    name = _shm_name(req_id)
+    mem = shared_memory.SharedMemory(name=name, create=True, size=8 + size)
+    struct.pack_into("Q", mem.buf, 0, size)
+    mem.buf[8:8 + size] = payload
+    mem.close()
+
+
+def _shm_read(req_id: str, timeout: float = 5.0) -> list[dict] | None:
+    """Read snapshot list from shared-memory, polling until available."""
+    name = _shm_name(req_id)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            mem = shared_memory.SharedMemory(name=name, create=False)
+        except FileNotFoundError:
+            time.sleep(0.05)
+            continue
+        size = struct.unpack_from("Q", mem.buf, 0)[0]
+        data = pickle.loads(bytes(mem.buf[8:8 + size]))
+        mem.close()
+        mem.unlink()
+        return data
+    return None
+
 
 def extract_k_from_kv_cache(
     kv_cache: torch.Tensor,
@@ -71,93 +106,12 @@ def get_kv_hook() -> Optional['KVHook']:
     return _kv_hook
 
 def load_kv_snapshot_data(req_id: str, prefix: str | None = None) -> list[dict[str, Any]] | None:
+    """Load KV snapshot(s) via shared memory (cross-process, no disk I/O).
+
+    The worker process writes snapshots to a named shared-memory segment.
+    This function polls briefly until the segment appears (typically < 100ms).
     """
-    Load KV snapshot(s) for completed request if KV Hook is enabled.
-    """
-    try:
-        req_id_safe = req_id.replace('-', '_')
-        pattern = f"/tmp/vllm_snapshot_{req_id_safe}_*.pt"
-
-        # NOTE(jehyun): Wait for snapshot files to be written
-        # The snapshot is written asynchronously by the model runner
-        # QK computation is done on CPU which can take significant time
-        max_wait = 60.0  # Maximum wait time in seconds
-        wait_interval = 0.2
-        elapsed = 0.0
-        files = []
-
-        while elapsed < max_wait:
-            files = glob.glob(pattern)
-            if files:
-                break
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-
-        # DEBUG: Log what we found
-        with open('/tmp/vllm_load_log.txt', 'a') as f:
-            f.write(f"[Load] req_id={req_id}, pattern={pattern}\n")
-            f.write(f"[Load] files found: {files}\n")
-
-        if not files: return None
-
-        # Check first file to see if capture was requested
-        first_data = torch.load(files[0])
-        extra_args = first_data.get('extra_args')
-        capture_on = bool(extra_args) and str(extra_args.get("kv_hook_capture", "0")) == "1"
-
-        with open('/tmp/vllm_load_log.txt', 'a') as f:
-            f.write(f"[Load] extra_args={extra_args}, capture_on={capture_on}\n")
-
-        if not capture_on:
-            return None
-
-        results, loaded_files = [], [] # Track successfully loaded files
-        files.sort()
-
-        for file_path in files:
-            try:
-                data = torch.load(file_path)
-                attn = data['attn_scores']
-                token_meta = data.get('token_meta')
-
-                # NOTE(jehyun): Keep load-side unsliced to avoid double slicing.
-                # Prefix slicing is handled at snapshot time only.
-                _ = prefix
-
-                # compressing for sending attn_score to clinet
-                compressed = gzip.compress(attn.numpy().tobytes())
-
-                results.append({
-                    'data': base64.b64encode(compressed).decode('utf-8'),
-                    'shape': list(attn.shape),
-                    'dtype': str(attn.dtype),
-                    'layer_idx': data.get('layer_idx'),
-                    'token_meta': token_meta,
-                })
-                loaded_files.append(file_path)  # Mark as successfully loaded
-
-            except Exception as e:
-                with open('/tmp/kv_load_debug.txt', 'a') as log:
-                    log.write(f"[Load] ERROR loading {file_path}: {e}\n")
-                continue
-
-        # Delete only successfully loaded files
-        for f in loaded_files:
-            try:
-                os.remove(f)
-                with open('/tmp/kv_load_debug.txt', 'a') as log:
-                    log.write(f"[Load] deleted: {f}\n")
-            except:
-                pass
-        
-        return results if results else None
-        
-    except Exception as e:
-        with open('/tmp/kv_load_debug.txt', 'a') as f:
-            f.write(f"[Load] ERROR for {req_id}: {e}\n")
-            import traceback
-            f.write(traceback.format_exc())
-        return None
+    return _shm_read(req_id, timeout=5.0)
 
 @dataclass
 class HookConfig:
@@ -183,7 +137,6 @@ class KVHook:
         # attention scores at the intended token output for many worker processes
         # (layer_idx, slot_id) -> list of [num_heads, head_dim] tensors
         self.q_buffer: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-        self.snapshots: Dict[str, Dict[str, Any]] = {}
         # Will follow the shutdown logic here form v1/core/sched/scheduler.py
         if self.config.enabled: print(f"[KV Hook] Initialized \
                                           for layers {sorted(config.layers)}")
@@ -420,8 +373,7 @@ class KVHook:
                 if layers_str:
                     target_layers = set(int(x.strip()) for x in layers_str.split(','))
 
-            # NOTE(jehyun): Do NOT compute ordered_slots here - it will be computed
-            # per-layer after finding the matching cache group for multi-modal requests
+            _req_snapshots: list[dict] = []  # collect per-layer results
 
             # Debug: Log block_ids info
             with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
@@ -444,31 +396,23 @@ class KVHook:
                         f.write(f"[Snapshot] Layer {layer_idx}: No buffer slots, skipping\n")
                     continue
 
-                # Auto-detect which block_ids group matches the buffer
+                # Auto-detect which block_ids group matches THIS request's buffer
                 matching_group_idx = None
                 ordered_slots = []
+                buffer_slot_set = set(buffer_slots_this_layer)
 
                 if req_state.block_ids:
-                    buffer_min, buffer_max = min(buffer_slots_this_layer), max(buffer_slots_this_layer)
-                    buffer_start_block = buffer_min // block_size
-
                     with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] Layer {layer_idx}: Buffer slot range [{buffer_min}, {buffer_max}]\n")
-                        f.write(f"[Snapshot] Buffer start block: {buffer_start_block}\n")
-
-                        # Check each block_ids group - match by starting block
+                        # Match by intersection: which group's slots overlap with buffer?
                         for group_idx, block_list in enumerate(req_state.block_ids):
                             if not block_list: continue
-
-                            # Check if buffer's starting block is in this group
-                            start_match = buffer_start_block in block_list
-                            group_min_slot = min(block_list) * block_size
-                            group_max_slot = (max(block_list) + 1) * block_size - 1
-
-                            f.write(f"[Snapshot]   group[{group_idx}]: blocks {block_list[:3]}...{block_list[-2:]} "
-                                   f"→ slots [{group_min_slot}, {group_max_slot}], match={start_match}\n")
-
-                            if start_match and matching_group_idx is None:
+                            group_slot_set = set()
+                            for bid in block_list:
+                                for off in range(block_size):
+                                    group_slot_set.add(bid * block_size + off)
+                            overlap = len(buffer_slot_set & group_slot_set)
+                            f.write(f"[Snapshot]   group[{group_idx}]: {len(block_list)} blocks, overlap={overlap}\n")
+                            if overlap > 0 and matching_group_idx is None:
                                 matching_group_idx = group_idx
 
                     if matching_group_idx is not None:
@@ -607,44 +551,32 @@ class KVHook:
                         block_size=block_size,
                     )
 
-                    # Store extra_args for output_processor to access
-                    extra_args = None
-                    if req_state.sampling_params and req_state.sampling_params.extra_args:
-                        extra_args = req_state.sampling_params.extra_args
-
-                    self.snapshots[req_id] = {
+                    # Encode to wire format and collect for shared memory
+                    compressed = gzip.compress(attn_scores.numpy().tobytes())
+                    _req_snapshots.append({
+                        'data': base64.b64encode(compressed).decode('utf-8'),
+                        'shape': list(attn_scores.shape),
+                        'dtype': str(attn_scores.dtype),
                         'layer_idx': layer_idx,
-                        'keys': k_tensor,
-                        'queries': q_tensor,
-                        'attn_scores': attn_scores,
                         'token_meta': token_meta,
-                        'extra_args': extra_args,  # Store for output_processor
-                    }
-
-                    save_path = f"/tmp/vllm_snapshot_{req_id.replace('-', '_')}_layer{layer_idx}_T{min_len}.pt"
-                    tmp_path = save_path + ".tmp"
-                    torch.save(self.snapshots[req_id], tmp_path)
-                    os.rename(tmp_path, save_path)  # Atomic rename prevents partial reads
+                    })
 
                     with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
                         f.write(f"[Snapshot] SUCCESS req={req_id}, layer={layer_idx}, tokens={min_len}\n")
                         f.write(f"[Snapshot] Attn scores: {attn_scores.shape}\n")
-                        f.write(f"[Snapshot] SAVED to {save_path}\n")
-                        f.write(
-                            "[SnapshotSummary] "
-                            f"REQ={req_id} "
-                            f"LAYER={layer_idx} "
-                            f"TOKENS={token_meta['captured_tokens_len']}/{token_meta['ordered_slots_len']}/{token_meta['num_tokens']} "
-                            f"OFFSET_CAND={token_meta['window_offset_candidate']} "
-                            f"LOCAL_BOUNDARY={token_meta['prompt_boundary_local']} "
-                            f"OFFSET_BOUNDARY={token_meta['prompt_boundary_with_offset_candidate']}\n"
-                        )
 
                     # Clean up this request's Q slots from buffer
                     for slot_id in request_slot_set:
                         self.q_buffer.pop((layer_idx, slot_id), None)
 
                     # break
+
+            # Write all collected layer snapshots to shared memory at once
+            if _req_snapshots:
+                _shm_write(req_id, _req_snapshots)
+                with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
+                    f.write(f"[Snapshot] SHM written: {len(_req_snapshots)} layers for {req_id}\n")
+
         except Exception as e:
             with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
                 f.write(f"[Snapshot] FAILED req={req_id if req_id else 'unknown'}: {e}\n")
