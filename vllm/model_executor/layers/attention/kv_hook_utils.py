@@ -19,17 +19,33 @@ def _shm_name(req_id: str) -> str:
 
 
 def _shm_write(req_id: str, snapshots: list[dict]) -> None:
-    """Write snapshot list to a named shared-memory segment."""
+    """Write snapshot list to a named shared-memory segment.
+
+    Protocol: size header is written LAST so readers treat size==0
+    as "write in progress" and keep polling.
+    """
     payload = pickle.dumps(snapshots)
     size, name = len(payload), _shm_name(req_id)
+    # Clean up stale segment from a previous failed run
+    try:
+        stale = shared_memory.SharedMemory(name=name, create=False)
+        stale.close()
+        stale.unlink()
+    except FileNotFoundError:
+        pass
     mem = shared_memory.SharedMemory(name=name, create=True, size=8 + size)
-    struct.pack_into("Q", mem.buf, 0, size)
-    mem.buf[8:8 + size] = payload
+    mem.buf[8:8 + size] = payload          # data first
+    struct.pack_into("Q", mem.buf, 0, size)  # size LAST (ready signal)
     mem.close()
 
 
 def _shm_read(req_id: str, timeout: float = 5.0) -> list[dict] | None:
-    """Read snapshot list from shared-memory, polling until available."""
+    """Read snapshot list from shared-memory, polling until available.
+
+    Handles race condition: if the segment exists but size==0 the writer
+    hasn't finished yet — close and retry.  Also catches corrupt reads
+    from partially-written segments.
+    """
     name, deadline = _shm_name(req_id), time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -38,10 +54,28 @@ def _shm_read(req_id: str, timeout: float = 5.0) -> list[dict] | None:
             time.sleep(0.05)
             continue
         size = struct.unpack_from("Q", mem.buf, 0)[0]
-        data = pickle.loads(bytes(mem.buf[8:8 + size]))
+        if size == 0:
+            # Writer created segment but hasn't finished writing yet
+            mem.close()
+            time.sleep(0.01)
+            continue
+        try:
+            data = pickle.loads(bytes(mem.buf[8:8 + size]))
+        except Exception:
+            # Corrupt read — writer may still be flushing; retry
+            mem.close()
+            time.sleep(0.01)
+            continue
         mem.close()
         mem.unlink()
         return data
+    # Timeout: clean up orphaned segment to prevent leaks
+    try:
+        mem = shared_memory.SharedMemory(name=name, create=False)
+        mem.close()
+        mem.unlink()
+    except FileNotFoundError:
+        pass
     return None
 
 
@@ -77,7 +111,7 @@ def extract_k_from_kv_cache(
         raise ValueError(
             f"Unsupported KV cache layout: ndim={kv_cache.ndim} shape={list(shape)}" )
 
-    return k.cpu().to(dtype)
+    return k.to(dtype)  # stay on GPU for fast attention computation
 
 
 _LAYER_PATTERNS = [
@@ -359,7 +393,7 @@ class KVHook:
             target_layers = self.config.layers  # Default from initialization
             if req_state.sampling_params and req_state.sampling_params.extra_args:
                 layers_str = req_state.sampling_params.extra_args.get('kv_hook_layers')
-                if layers_str:
+                if layers_str and layers_str.strip().lower() != 'all':
                     target_layers = set(int(x.strip()) for x in layers_str.split(','))
 
             _req_snapshots: list[dict] = []  # collect per-layer results
@@ -503,7 +537,11 @@ class KVHook:
                         
                     # [T, H, D]
                     q_tensor, k_tensor = torch.stack(q_list[:min_len]), torch.stack(k_list[:min_len])
-                    
+
+                    # Move Q to GPU for fast bmm (K is already on GPU from KV cache)
+                    if k_tensor.is_cuda and not q_tensor.is_cuda:
+                        q_tensor = q_tensor.to(k_tensor.device)
+
                     # calculate attention
                     # support: GQA, Vanilla Attention
                     # need testing: Sliding-Window, Multi-Modal(Encoder) mixed, permutation
@@ -537,6 +575,7 @@ class KVHook:
                     )
 
                     # Encode to wire format and collect for shared memory
+                    attn_scores = attn_scores.cpu()
                     compressed = gzip.compress(attn_scores.numpy().tobytes())
                     _req_snapshots.append({
                         'data': base64.b64encode(compressed).decode('utf-8'),
