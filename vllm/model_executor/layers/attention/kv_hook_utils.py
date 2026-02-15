@@ -183,7 +183,6 @@ class KVHook:
         # attention scores at the intended token output for many worker processes
         # (layer_idx, slot_id) -> list of [num_heads, head_dim] tensors
         self.q_buffer: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-        self.k_buffer: Dict[Tuple[int, int], List[torch.Tensor]] = {}
         self.snapshots: Dict[str, Dict[str, Any]] = {}
         # Will follow the shutdown logic here form v1/core/sched/scheduler.py
         if self.config.enabled: print(f"[KV Hook] Initialized \
@@ -196,27 +195,28 @@ class KVHook:
         self.runtime_enabled_this_step = False
 
     def buffer_qk_pair(self, query: torch.Tensor, key: torch.Tensor, attn_metadata, layer_name: str) -> None:
-        """Buffer Query, Key token at attnetion-computation"""
-        
+        """Buffer Query tokens at attention-computation time.
+
+        K is NOT buffered here — it is read directly from the KV cache
+        at request completion time via extract_k_from_kv_cache().
+        """
+
         if not self.config.enabled: return
         if attn_metadata is None:  return
-        
+
         layer_idx = self._extract_layer_idx(layer_name)
-        # if layer_idx < 0 or layer_idx not in self.config.layers: return
-        # NOTE(jehyun): Buffer all layers - filtering happens at snapshot time
-        # Original: if layer_idx < 0 or layer_idx not in self.config.layers: return
         if layer_idx < 0: return
 
         slot_ids = attn_metadata.slot_mapping
         if query.shape[0] != slot_ids.shape[0]: return
 
         try:
-            query_cpu, key_cpu = query.detach().cpu().clone(), key.detach().cpu().clone()
-        except: 
+            query_cpu = query.detach().cpu().clone()
+        except:
             return
-        
+
         for i in range(query.shape[0]):
-            
+
             slot_id = slot_ids[i].item()
             if slot_id < 0: continue
 
@@ -225,11 +225,6 @@ class KVHook:
 
             q_token = query_cpu[i].to(torch.float16) if query_cpu[i].dtype != torch.float16 else query_cpu[i]
             self.q_buffer[buffer_key].append(q_token)
-            
-            if buffer_key not in self.k_buffer: self.k_buffer[buffer_key] = []
-            
-            k_token = key_cpu[i].to(torch.float16) if key_cpu[i].dtype != torch.float16 else key_cpu[i]
-            self.k_buffer[buffer_key].append(k_token)
     
     # May not support Multi-Model, Head-permutation
     # _compute_ordered_slots_from_request
@@ -523,55 +518,27 @@ class KVHook:
 
                 min_slot = min(ordered_slots)
 
-                # Collect Q/K in deterministic token order.
+                # Collect Q from buffer in deterministic token order.
+                q_slot_ids: list[int] = []
                 for slot_idx, slot_id in enumerate(ordered_slots):
-                    q_tokens, k_tokens = self.q_buffer.get((layer_idx, slot_id)), self.k_buffer.get((layer_idx, slot_id))
-
-                    if not q_tokens or not k_tokens: continue
-
+                    q_tokens = self.q_buffer.get((layer_idx, slot_id))
+                    if not q_tokens: continue
                     q_list.append(q_tokens[0])
-                    k_list.append(k_tokens[0])
-                    # Use slot_idx as token position within this window
+                    q_slot_ids.append(slot_id)
                     token_idx.append(slot_idx)
 
+                # Read K directly from KV cache (no per-step buffering needed)
+                kv_cache_idx = layer_idx if layer_idx < len(kv_caches) else matching_group_idx
+                if q_list and kv_caches and kv_cache_idx is not None and kv_cache_idx < len(kv_caches):
+                    k_from_cache = extract_k_from_kv_cache(
+                        kv_caches[kv_cache_idx], q_slot_ids
+                    )
+                    k_list = [k_from_cache[i] for i in range(k_from_cache.shape[0])]
+
                 with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                    f.write(f"[Snapshot] Buffer has {len(buffer_slots_this_layer)} slots for layer {layer_idx}\n")
-                    f.write(f"[Snapshot] Buffer sample slots: {sorted(buffer_slots_this_layer)[:10]}\n")
+                    f.write(f"[Snapshot] Buffer has {len(buffer_slots_this_layer)} Q slots for layer {layer_idx}\n")
+                    f.write(f"[Snapshot] K read from KV cache: {len(k_list)} tokens\n")
                     f.write(f"[Snapshot] q_list: {len(q_list)}, k_list: {len(k_list)}\n")
-            
-                
-                # ============================================================
-                # TEST: Read K directly from KV cache and compare with buffer
-                # ============================================================
-                try:
-                    if kv_caches and ordered_slots and k_list:
-                        kv_cache_idx = layer_idx if layer_idx < len(kv_caches) else matching_group_idx
-                        if kv_cache_idx is not None and kv_cache_idx < len(kv_caches):
-                            k_from_cache = extract_k_from_kv_cache(
-                                kv_caches[kv_cache_idx], ordered_slots
-                            )
-                            k_buffered = torch.stack(k_list)
-                            cmp_len = min(k_from_cache.shape[0], k_buffered.shape[0])
-                            kc, kb = k_from_cache[:cmp_len], k_buffered[:cmp_len]
-                            max_diff = (kc.float() - kb.float()).abs().max().item()
-                            cos_sim = torch.nn.functional.cosine_similarity(
-                                kc.float().reshape(-1).unsqueeze(0),
-                                kb.float().reshape(-1).unsqueeze(0),
-                            ).item()
-                            status = "PASS" if max_diff < 0.01 else "FAIL"
-                            with open('/tmp/vllm_kv_cache_read_test.log', 'a') as f:
-                                f.write(
-                                    f"[KV_READ_TEST] req={req_id} layer={layer_idx} "
-                                    f"cache_shape={list(kv_caches[kv_cache_idx].shape)} "
-                                    f"tokens={cmp_len} max_diff={max_diff:.8f} "
-                                    f"cos_sim={cos_sim:.8f} {status}\n"
-                                )
-                except Exception as e:
-                    with open('/tmp/vllm_kv_cache_read_test.log', 'a') as f:
-                        f.write(f"[KV_READ_TEST] EXCEPTION req={req_id} layer={layer_idx}: {e}\n")
-                        import traceback
-                        f.write(traceback.format_exc() + "\n")
-                # ============================================================
 
                 if q_list and k_list:
 
@@ -673,11 +640,9 @@ class KVHook:
                             f"OFFSET_BOUNDARY={token_meta['prompt_boundary_with_offset_candidate']}\n"
                         )
 
-                    # Clean up this request's slots from buffer to prevent contamination
+                    # Clean up this request's Q slots from buffer
                     for slot_id in request_slot_set:
-                        key = (layer_idx, slot_id)
-                        self.q_buffer.pop(key, None)
-                        self.k_buffer.pop(key, None)
+                        self.q_buffer.pop((layer_idx, slot_id), None)
 
                     # break
         except Exception as e:
