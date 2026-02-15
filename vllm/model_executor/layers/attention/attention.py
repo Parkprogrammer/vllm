@@ -701,7 +701,7 @@ def unified_attention_with_output(
     kv_hook = get_kv_hook()
 
     if kv_hook and kv_hook.config.enabled and kv_hook.runtime_enabled_this_step:
-        kv_hook.buffer_qk_pair(
+        kv_hook.buffer_query(
             query=query,
             key=key,
             attn_metadata=attn_metadata,

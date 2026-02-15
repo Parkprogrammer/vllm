@@ -925,7 +925,7 @@ class GPUModelRunner(
 
                     if should_capture:
                         try:
-                            self.kv_hook.snapshot_keys_immediate(
+                            self.kv_hook.capture_kv_q_attention(
                                 req_state=req_state,
                                 block_size=self.cache_config.block_size,
                                 kv_caches=self.kv_caches,

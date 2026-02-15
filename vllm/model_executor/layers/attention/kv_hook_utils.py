@@ -21,8 +21,7 @@ def _shm_name(req_id: str) -> str:
 def _shm_write(req_id: str, snapshots: list[dict]) -> None:
     """Write snapshot list to a named shared-memory segment."""
     payload = pickle.dumps(snapshots)
-    size = len(payload)
-    name = _shm_name(req_id)
+    size, name = len(payload), _shm_name(req_id)
     mem = shared_memory.SharedMemory(name=name, create=True, size=8 + size)
     struct.pack_into("Q", mem.buf, 0, size)
     mem.buf[8:8 + size] = payload
@@ -31,8 +30,7 @@ def _shm_write(req_id: str, snapshots: list[dict]) -> None:
 
 def _shm_read(req_id: str, timeout: float = 5.0) -> list[dict] | None:
     """Read snapshot list from shared-memory, polling until available."""
-    name = _shm_name(req_id)
-    deadline = time.monotonic() + timeout
+    name, deadline = _shm_name(req_id), time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             mem = shared_memory.SharedMemory(name=name, create=False)
@@ -60,28 +58,24 @@ def extract_k_from_kv_cache(
 
     Returns: Tensor of shape [len(slot_ids), num_kv_heads, head_dim]
     """
-    shape = kv_cache.shape
-    slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=kv_cache.device)
+    shape, slot_tensor = kv_cache.shape, torch.tensor(slot_ids, dtype=torch.long, device=kv_cache.device)
 
     if kv_cache.ndim == 5 and shape[0] == 2:
         # FlashAttention layout: [2(K/V), num_blocks, page_size, ...]
-        page_size = shape[2]
-        num_slots = shape[1] * page_size
+        page_size, num_slots = shape[2], shape[1] * page_size
         k_flat = kv_cache[0].reshape(num_slots, -1)          # [total_slots, kv_heads*head_dim]
         k = k_flat[slot_tensor].view(len(slot_ids), shape[3], shape[4])
     elif kv_cache.ndim == 5 and shape[1] == 2:
         # FlashInfer layout: [num_blocks, 2(K/V), page_size, ...]
         page_size = shape[2]
-        page_indices = slot_tensor // page_size
-        page_offsets = slot_tensor % page_size
+        page_indices, page_offsets = slot_tensor // page_size, slot_tensor % page_size
         k = kv_cache[page_indices, 0, page_offsets]           # [T, kv_heads, head_dim]
     elif kv_cache.ndim == 3 and shape[0] == 2:
         # Simple layout: [2, total_slots, hidden]
         k = kv_cache[0, slot_tensor]
     else:
         raise ValueError(
-            f"Unsupported KV cache layout: ndim={kv_cache.ndim} shape={list(shape)}"
-        )
+            f"Unsupported KV cache layout: ndim={kv_cache.ndim} shape={list(shape)}" )
 
     return k.cpu().to(dtype)
 
@@ -147,7 +141,7 @@ class KVHook:
         # For tracing snapshot, buffering logic on/off for each batch step
         self.runtime_enabled_this_step = False
 
-    def buffer_qk_pair(self, query: torch.Tensor, key: torch.Tensor, attn_metadata, layer_name: str) -> None:
+    def buffer_query(self, query: torch.Tensor, key: torch.Tensor, attn_metadata, layer_name: str) -> None:
         """Buffer Query tokens at attention-computation time.
 
         K is NOT buffered here — it is read directly from the KV cache
@@ -272,9 +266,7 @@ class KVHook:
         if cursor < prompt_len: language_ranges.append({"start": cursor, "end": prompt_len})
 
         ordered_len = int(ordered_slots_len if ordered_slots_len is not None else len(token_idx))
-        captured_len = int(
-            captured_tokens_len if captured_tokens_len is not None else len(token_idx)
-        )
+        captured_len = int(captured_tokens_len if captured_tokens_len is not None else len(token_idx))
 
         # NOTE(jehyun): Compute window offset
         # The captured window represents the last N tokens of the sequence
@@ -284,15 +276,12 @@ class KVHook:
         # window_start_slot is provided for debugging/logging only
         _ = window_start_slot
 
-        token_idx_min = int(min(token_idx)) if token_idx else None
-        token_idx_max = int(max(token_idx)) if token_idx else None
+        token_idx_min, token_idx_max = int(min(token_idx)) if token_idx else None, int(max(token_idx)) if token_idx else None
         prompt_boundary_local = bisect_left(token_idx, prompt_len) if token_idx else None
 
         # Apply window offset to get absolute token indices
         token_idx_shifted = [int(i) + window_offset for i in token_idx]
-        prompt_boundary_with_offset = (
-            bisect_left(token_idx_shifted, prompt_len) if token_idx_shifted else None
-        )
+        prompt_boundary_with_offset = (bisect_left(token_idx_shifted, prompt_len) if token_idx_shifted else None)
 
         return {
             "token_idx": [int(i) for i in token_idx],
@@ -356,7 +345,7 @@ class KVHook:
         return probs.transpose(0, 1)  # [hq, T, T] -> [T, hq, T]
 
     
-    def snapshot_keys_immediate(self, req_state, block_size: int, kv_caches, prefix: str | None = None) -> None:
+    def capture_kv_q_attention(self, req_state, block_size: int, kv_caches, prefix: str | None = None) -> None:
         """
          At the timing of freeing request of vllm-engine,
          create 1 snapshot of attention scores for the requested req_id
@@ -449,21 +438,17 @@ class KVHook:
                     continue
 
                 request_slot_set = set(ordered_slots)
-                q_list = []
-                k_list = []
-
+                q_list, k_list = [], []
                 token_idx: list[int] = []
+                q_slot_ids: list[int] = []
 
                 # NOTE(jehyun): Build a mapping from slot_id to absolute token position
                 # For multi-modal requests, ordered_slots may not start from 0
                 # We need to find the actual token index based on slot position
-                if not ordered_slots:
-                    continue
-
+                if not ordered_slots: continue
                 min_slot = min(ordered_slots)
 
                 # Collect Q from buffer in deterministic token order.
-                q_slot_ids: list[int] = []
                 for slot_idx, slot_id in enumerate(ordered_slots):
                     q_tokens = self.q_buffer.get((layer_idx, slot_id))
                     if not q_tokens: continue
