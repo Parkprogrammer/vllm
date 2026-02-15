@@ -24,7 +24,7 @@ def _shm_write(req_id: str, snapshots: list[dict]) -> None:
     Protocol: size header is written LAST so readers treat size==0
     as "write in progress" and keep polling.
     """
-    payload = pickle.dumps(snapshots)
+    payload = pickle.dumps(snapshots)  # Trust boundary: only vLLM worker writes
     size, name = len(payload), _shm_name(req_id)
     # Clean up stale segment from a previous failed run
     try:
@@ -165,10 +165,6 @@ class KVHook:
         # attention scores at the intended token output for many worker processes
         # (layer_idx, slot_id) -> list of [num_heads, head_dim] tensors
         self.q_buffer: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-        # Will follow the shutdown logic here form v1/core/sched/scheduler.py
-        if self.config.enabled: print(f"[KV Hook] Initialized \
-                                          for layers {sorted(config.layers)}")
-        
         # Search the layer name once, keep for the same worker.
         self._layer_idx_cache: Dict[str, int] = {}
 
@@ -193,7 +189,7 @@ class KVHook:
 
         try:
             query_cpu = query.detach().cpu().clone()
-        except:
+        except Exception:
             return
 
         for i in range(query.shape[0]):
@@ -247,16 +243,8 @@ class KVHook:
         token_idx: list[int],
         *,
         ordered_slots_len: int | None = None,
-        captured_tokens_len: int | None = None,
-        window_start_slot: int | None = None,
-        block_size: int = 16,
     ) -> dict[str, Any]:
-        """Build token mapping metadata for post-hoc client-side alignment.
-
-        Args:
-            window_start_slot: The actual starting slot_id of the captured window.
-                              Used to compute the absolute token offset.
-        """
+        """Build token mapping metadata for post-hoc client-side alignment."""
 
         prompt_len = int(getattr(req_state, "num_prompt_tokens", 0) or 0)
         total_len = int(getattr(req_state, "num_tokens", prompt_len) or prompt_len)
@@ -300,20 +288,9 @@ class KVHook:
         if cursor < prompt_len: language_ranges.append({"start": cursor, "end": prompt_len})
 
         ordered_len = int(ordered_slots_len if ordered_slots_len is not None else len(token_idx))
-        captured_len = int(captured_tokens_len if captured_tokens_len is not None else len(token_idx))
-
-        # NOTE(jehyun): Compute window offset
-        # The captured window represents the last N tokens of the sequence
-        # where N = ordered_len (number of slots in the captured window)
         window_offset = int(total_len - ordered_len)
 
-        # window_start_slot is provided for debugging/logging only
-        _ = window_start_slot
-
-        token_idx_min, token_idx_max = int(min(token_idx)) if token_idx else None, int(max(token_idx)) if token_idx else None
         prompt_boundary_local = bisect_left(token_idx, prompt_len) if token_idx else None
-
-        # Apply window offset to get absolute token indices
         token_idx_shifted = [int(i) + window_offset for i in token_idx]
         prompt_boundary_with_offset = (bisect_left(token_idx_shifted, prompt_len) if token_idx_shifted else None)
 
@@ -321,19 +298,10 @@ class KVHook:
             "token_idx": [int(i) for i in token_idx],
             "prompt_len": prompt_len,
             "total_len": total_len,
-            "generated_range": {"start": prompt_len, "end": total_len},
             "vision_ranges": vision_ranges,
             "language_ranges": language_ranges,
-            # Diagnostic-only fields: keep token_idx semantics unchanged.
             "token_idx_basis": "window_local",
-            "ordered_slots_len": ordered_len,
-            "captured_tokens_len": captured_len,
-            "num_tokens": total_len,
-            "num_prompt_tokens": prompt_len,
-            "window_offset_candidate": window_offset,  # Now computed from actual slot position
-            "window_start_slot": window_start_slot,
-            "token_idx_min": token_idx_min,
-            "token_idx_max": token_idx_max,
+            "window_offset_candidate": window_offset,
             "prompt_boundary_local": prompt_boundary_local,
             "prompt_boundary_with_offset_candidate": prompt_boundary_with_offset,
         }
@@ -345,13 +313,7 @@ class KVHook:
         hq, Tq, d = q.shape
         hk, Tk, dk = k.shape
 
-        # Debug: Log attention computation details
-        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-            f.write(f"[Attention] Q: hq={hq}, Tq={Tq}, d={d} | K: hk={hk}, Tk={Tk}, dk={dk}\n")
-
         if d != dk or Tq != Tk:
-            with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                f.write(f"[Attention] MISMATCH! d={d} vs dk={dk}, Tq={Tq} vs Tk={Tk}\n")
             return None
 
         # Always create a mapping index from hk to hq
@@ -370,9 +332,6 @@ class KVHook:
             idx = torch.clamp(idx, 0, hk - 1)
             k_m = k.index_select(0, idx)
             mode = f"resample_hq={hq}_hk={hk}"
-
-        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-            f.write(f"[Attention] Mode: {mode}\n")
 
         scores = torch.bmm(q, k_m.transpose(-2, -1)) * scale
         probs = torch.softmax(scores, dim=-1)
@@ -398,15 +357,6 @@ class KVHook:
 
             _req_snapshots: list[dict] = []  # collect per-layer results
 
-            # Debug: Log block_ids info
-            with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                f.write(f"[Snapshot] block_size={block_size}\n")
-                f.write(f"[Snapshot] num_tokens={req_state.num_tokens}\n")
-                f.write(f"[Snapshot] block_ids type: {type(req_state.block_ids)}, len: {len(req_state.block_ids) if req_state.block_ids else 0}\n")
-                if req_state.block_ids:
-                    for i, block_list in enumerate(req_state.block_ids):
-                        f.write(f"[Snapshot] block_ids[{i}]: {block_list[:5]}... (len={len(block_list)})\n")
-
             # for layer_idx in self.config.layers:
             # Original logic: iterate over target_layers instead of self.config.layers
             for layer_idx in target_layers:  # ← Changed from self.config.layers
@@ -414,34 +364,25 @@ class KVHook:
                 # Debug: Log actual buffer slot_ids for this layer
                 buffer_slots_this_layer = [slot_id for (l_idx, slot_id) in self.q_buffer.keys() if l_idx == layer_idx]
 
-                if not buffer_slots_this_layer:
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] Layer {layer_idx}: No buffer slots, skipping\n")
-                    continue
+                if not buffer_slots_this_layer: continue
 
                 # Auto-detect which block_ids group matches THIS request's buffer
-                matching_group_idx = None
-                ordered_slots = []
+                matching_group_idx, ordered_slots = None, []
                 buffer_slot_set = set(buffer_slots_this_layer)
 
                 if req_state.block_ids:
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        # Match by intersection: which group's slots overlap with buffer?
-                        for group_idx, block_list in enumerate(req_state.block_ids):
-                            if not block_list: continue
-                            group_slot_set = set()
-                            for bid in block_list:
-                                for off in range(block_size):
-                                    group_slot_set.add(bid * block_size + off)
-                            overlap = len(buffer_slot_set & group_slot_set)
-                            f.write(f"[Snapshot]   group[{group_idx}]: {len(block_list)} blocks, overlap={overlap}\n")
-                            if overlap > 0 and matching_group_idx is None:
-                                matching_group_idx = group_idx
+                    # Match by intersection: which group's slots overlap with buffer?
+                    for group_idx, block_list in enumerate(req_state.block_ids):
+                        if not block_list: continue
+                        group_slot_set = set()
+                        for bid in block_list:
+                            for off in range(block_size):
+                                group_slot_set.add(bid * block_size + off)
+                        overlap = len(buffer_slot_set & group_slot_set)
+                        if overlap > 0 and matching_group_idx is None:
+                            matching_group_idx = group_idx
 
                     if matching_group_idx is not None:
-                        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                            f.write(f"[Snapshot] MATCH! Layer {layer_idx} uses cache group {matching_group_idx}\n")
-
                         # Compute ordered_slots using ONLY the matched group
                         matched_blocks = req_state.block_ids[matching_group_idx]
                         tokens_processed = 0
@@ -459,16 +400,9 @@ class KVHook:
                                 seen_slots.add(slot_id)
                             tokens_processed += tokens_in_this_block
 
-                        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                            f.write(f"[Snapshot] Computed {len(ordered_slots)} slots from matched group\n")
-                            f.write(f"[Snapshot] Sample slots: {ordered_slots[:10]}\n")
                     else:
-                        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                            f.write(f"[Snapshot] WARNING: No matching cache group found for layer {layer_idx}\n")
                         continue
                 else:
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] WARNING: No block_ids for request {req_id}\n")
                     continue
 
                 request_slot_set = set(ordered_slots)
@@ -498,25 +432,10 @@ class KVHook:
                     )
                     k_list = [k_from_cache[i] for i in range(k_from_cache.shape[0])]
 
-                with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                    f.write(f"[Snapshot] Buffer has {len(buffer_slots_this_layer)} Q slots for layer {layer_idx}\n")
-                    f.write(f"[Snapshot] K read from KV cache: {len(k_list)} tokens\n")
-                    f.write(f"[Snapshot] q_list: {len(q_list)}, k_list: {len(k_list)}\n")
-
                 if q_list and k_list:
 
                     q0, k0 = q_list[0], k_list[0]
                     triples = []
-                    
-                    # Debug: Log tensor shapes before filtering
-                    unique_q_shapes = set(tuple(t.shape) for t in q_list if isinstance(t, torch.Tensor))
-                    unique_k_shapes = set(tuple(t.shape) for t in k_list if isinstance(t, torch.Tensor))
-
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] Q unique shapes: {unique_q_shapes}\n")
-                        f.write(f"[Snapshot] K unique shapes: {unique_k_shapes}\n")
-                        f.write(f"[Snapshot] Q[0] shape: {q0.shape}, K[0] shape: {k0.shape}\n")
-
                     
                     for idx, q_tok, k_tok in zip(token_idx, q_list, k_list):
                         if (isinstance(q_tok, torch.Tensor) and isinstance(k_tok, torch.Tensor)
@@ -528,10 +447,6 @@ class KVHook:
                     token_idx, q_list, k_list = [t[0] for t in triples], [t[1] for t in triples], \
                                                         [t[2] for t in triples]
 
-                    # Debug: Log if any tensors were filtered out
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] After filtering: q_list={len(q_list)}, k_list={len(k_list)}\n")
-                    
                     min_len = min(len(q_list), len(k_list))
                     if min_len == 0: continue
                         
@@ -549,10 +464,7 @@ class KVHook:
                     scale = 1.0 / (head_dim ** 0.5)
                     attn_scores = self._compute_attention(q_tensor, k_tensor, scale)
 
-                    if attn_scores is None:
-                        with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                            f.write(f"[Snapshot] SKIP req={req_id} (incompatible attention)\n")
-                        continue
+                    if attn_scores is None: continue
                     
                     # Can this prefix work?
                     if prefix:
@@ -562,16 +474,10 @@ class KVHook:
                         attn_scores = attn_scores[q_start:q_end, :, :]
                         token_idx = token_idx[q_start:q_end]
 
-                    # Pass the starting slot of this window to compute correct offset
-                    window_start_slot = min(ordered_slots) if ordered_slots else None
-
                     token_meta = self.build_token_meta(
                         req_state,
                         token_idx,
                         ordered_slots_len=len(ordered_slots),
-                        captured_tokens_len=len(token_idx),
-                        window_start_slot=window_start_slot,
-                        block_size=block_size,
                     )
 
                     # Encode to wire format and collect for shared memory
@@ -585,10 +491,6 @@ class KVHook:
                         'token_meta': token_meta,
                     })
 
-                    with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                        f.write(f"[Snapshot] SUCCESS req={req_id}, layer={layer_idx}, tokens={min_len}\n")
-                        f.write(f"[Snapshot] Attn scores: {attn_scores.shape}\n")
-
                     # Clean up this request's Q slots from buffer
                     for slot_id in request_slot_set:
                         self.q_buffer.pop((layer_idx, slot_id), None)
@@ -598,14 +500,9 @@ class KVHook:
             # Write all collected layer snapshots to shared memory at once
             if _req_snapshots:
                 _shm_write(req_id, _req_snapshots)
-                with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                    f.write(f"[Snapshot] SHM written: {len(_req_snapshots)} layers for {req_id}\n")
 
-        except Exception as e:
-            with open('/tmp/vllm_snapshot_log.txt', 'a') as f:
-                f.write(f"[Snapshot] FAILED req={req_id if req_id else 'unknown'}: {e}\n")
-                import traceback
-                f.write(traceback.format_exc())
+        except Exception:
+            pass
             
     def _extract_layer_idx(self, layer_name: str) -> int:
         

@@ -730,8 +730,6 @@ class GPUModelRunner(
                 layers = set(range(num_layers))
 
             config = HookConfig(enabled=True, layers=layers, topk=10)
-            with open('/tmp/vllm_init_debug.log', 'w') as f:
-                f.write(f"init_kv_hook called with config={config}\n")
             self.init_kv_hook(config)
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -919,8 +917,6 @@ class GPUModelRunner(
                         extra_args = req_state.sampling_params.extra_args
                         if extra_args:
                             should_capture = str(extra_args.get('kv_hook_capture', '1')) == '1'
-                            with open('/tmp/vllm_snapshot_debug.log', 'a') as f:
-                                f.write(f"req_id={req_id}, should_capture={should_capture}, prefix={prefix}\n")
                             prefix = extra_args.get('kv_hook_prefix')
 
                     if should_capture:
@@ -931,9 +927,10 @@ class GPUModelRunner(
                                 kv_caches=self.kv_caches,
                                 prefix=prefix,
                             )
-                        except Exception as e:
-                            with open('/tmp/vllm_snapshot_debug.log', 'a') as f:
-                                f.write(f"Snapshot failed for {req_id}: {e}\n")
+                        except Exception:
+                            logger.warning(
+                                "Capturing attention failed for %s",
+                                req_id, exc_info=True)
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)

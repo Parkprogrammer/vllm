@@ -362,14 +362,12 @@ class RequestState:
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
 
-        # TODO(jehyun): Load KV hook snapshot data if request finished
+        # Load KV hook snapshot data if capture was requested for this request
         kv_hook_data = None
-        if finished:
+        if finished and getattr(self, 'kv_hook_capture', False):
             from vllm.model_executor.layers.attention.kv_hook_utils import (
                 load_kv_snapshot_data,
             )
-
-            # Load snapshot data - extra_args will be extracted from snapshot file
             kv_hook_data = load_kv_snapshot_data(self.request_id, prefix=None)
 
         return RequestOutput(
@@ -556,6 +554,11 @@ class OutputProcessor:
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
+
+        # Track KV hook capture requests
+        sp = request.sampling_params
+        if sp and sp.extra_args and sp.extra_args.get('kv_hook_capture'):
+            req_state.kv_hook_capture = True
 
         # Track the external_req_id -> [internal_req_id, ...] mapping
         self.external_req_ids[req_state.external_req_id].append(request_id)

@@ -123,7 +123,7 @@ class RequestOutput:
         *,
         multi_modal_placeholders: MultiModalPlaceholderDict | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
-        kv_hook_data: dict[str, Any] | None = None, # NOTE(jehyun): For loading attn_score vector from server-side.
+        kv_hook_data: list[dict[str, Any]] | None = None, # NOTE(jehyun): For loading attn_score vector from server-side.
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,

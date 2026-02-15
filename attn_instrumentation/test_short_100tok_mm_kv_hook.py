@@ -164,8 +164,6 @@ def main():
             if isinstance(token_idx, list) and token_idx and all(
                 isinstance(v, int) for v in token_idx
             ):
-                diagnostics["token_idx_min"] = int(min(token_idx))
-                diagnostics["token_idx_max"] = int(max(token_idx))
             diagnostics["prompt_len"] = token_meta.get("prompt_len")
             diagnostics["offset_candidate"] = token_meta.get("window_offset_candidate")
             diagnostics["boundary_local"] = token_meta.get("prompt_boundary_local")
