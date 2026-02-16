@@ -1739,8 +1739,7 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
-            # NOTE(jehyun): For adding kv hook to response
-            kv_hook_data=final_res.kv_hook_data,
+            attn_capture_data=final_res.attn_capture_data,
         )
 
         # Log complete response if output logging is enabled

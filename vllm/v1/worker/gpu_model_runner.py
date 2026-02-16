@@ -435,8 +435,8 @@ class GPUModelRunner(
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
 
-        # NOTE(jehyun): For the runner to have a hook for each thread
-        self.kv_hook = None
+        # NOTE(jehyun): Per-worker attention capture instance
+        self.attn_capture = None
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -713,24 +713,22 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
 
-        # NOTE(jehyun): Init for KV hook with global setter
+        # NOTE(jehyun): Init attention capture with global setter
         if self.vllm_config.cache_config.enable_attention_instrumentation:
-            from vllm.model_executor.layers.attention.kv_hook_utils import HookConfig
+            from vllm.model_executor.layers.attention.attn_capture import CaptureConfig
             layers_str = self.vllm_config.cache_config.attention_instrumentation_layers
 
-            # Get num_layers (handle both text-only and multimodal models)
             hf_config = self.vllm_config.model_config.hf_config
             num_layers = getattr(hf_config, 'num_hidden_layers',
                                getattr(hf_config, 'text_config', hf_config).num_hidden_layers)
 
-            # Parse layers_str to get target layer indices
             if layers_str and layers_str.lower() != "all":
                 layers = set(int(x.strip()) for x in layers_str.split(','))
             else:
                 layers = set(range(num_layers))
 
-            config = HookConfig(enabled=True, layers=layers)
-            self.init_kv_hook(config)
+            config = CaptureConfig(enabled=True, layers=layers)
+            self.init_attn_capture(config)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -906,22 +904,21 @@ class GPUModelRunner(
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
 
-            # NOTE(jehyun): Snapshot KV hook data before removing request
-            if self.kv_hook and self.kv_hook.config.enabled:
+            # NOTE(jehyun): Capture attention before removing request
+            if self.attn_capture and self.attn_capture.config.enabled:
                 req_state = self.requests.get(req_id)
                 if req_state:
-                    # Check if should capture & get prefix
                     should_capture = False
                     prefix = None
                     if req_state.sampling_params:
                         extra_args = req_state.sampling_params.extra_args
                         if extra_args:
-                            should_capture = str(extra_args.get('kv_hook_capture', '0')) == '1'
-                            prefix = extra_args.get('kv_hook_prefix')
+                            should_capture = str(extra_args.get('attn_capture', '0')) == '1'
+                            prefix = extra_args.get('attn_capture_prefix')
 
                     if should_capture:
                         try:
-                            self.kv_hook.capture_kv_q_attention(
+                            self.attn_capture.capture(
                                 req_state=req_state,
                                 block_size=self.cache_config.block_size,
                                 kv_caches=self.kv_caches,
@@ -932,10 +929,7 @@ class GPUModelRunner(
                                 "Capturing attention failed for %s",
                                 req_id, exc_info=True)
 
-                    # Always clean up Q buffer for finished requests
-                    # (regardless of capture flag) to prevent stale data
-                    # when KV cache blocks are reallocated to new requests.
-                    self.kv_hook.cleanup_request_buffers(
+                    self.attn_capture.cleanup_request_buffers(
                         req_state.block_ids, self.cache_config.block_size)
 
             self.requests.pop(req_id, None)
@@ -3395,11 +3389,9 @@ class GPUModelRunner(
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
-            # NOTE(jehyun): Tracing snapshot/buffering settings
-            # Build per-request capture_slots so buffer_query only stores Q
-            # for capture-enabled requests, preventing cross-request leakage
-            # when KV cache blocks are later reallocated.
-            if self.kv_hook:
+            # NOTE(jehyun): Build per-request capture_slots so buffer_query
+            # only stores Q for capture-enabled requests.
+            if self.attn_capture:
                 capture_slots: set[int] | None = None
                 block_size = self.cache_config.block_size
 
@@ -3407,7 +3399,7 @@ class GPUModelRunner(
                     req_state = self.requests.get(req_id)
                     if req_state and req_state.sampling_params:
                         extra_args = req_state.sampling_params.extra_args
-                        if extra_args and str(extra_args.get('kv_hook_capture', '0')) == '1':
+                        if extra_args and str(extra_args.get('attn_capture', '0')) == '1':
                             if capture_slots is None:
                                 capture_slots = set()
                             for block_list in req_state.block_ids:
@@ -3415,8 +3407,8 @@ class GPUModelRunner(
                                     for off in range(block_size):
                                         capture_slots.add(bid * block_size + off)
 
-                self.kv_hook.runtime_enabled_this_step = capture_slots is not None
-                self.kv_hook.capture_slots = capture_slots
+                self.attn_capture.runtime_enabled_this_step = capture_slots is not None
+                self.attn_capture.capture_slots = capture_slots
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -6333,13 +6325,13 @@ class GPUModelRunner(
                     stats.encoder_forward_time += per_request_time
                     stats.num_encoder_calls += 1
 
-    # NOTE(jehyun): For the runner to have a hook for each thread
-    def init_kv_hook(self, config) -> None:
-        """Initialize KV hook for attention instrumentation."""
-        from vllm.model_executor.layers.attention.kv_hook_utils import KVHook, set_kv_hook
+    def init_attn_capture(self, config) -> None:
+        """Initialize attention capture for instrumentation."""
+        from vllm.model_executor.layers.attention.attn_capture import (
+            AttentionCapture, set_attn_capture)
 
-        self.kv_hook = KVHook(config)
-        set_kv_hook(self.kv_hook)
+        self.attn_capture = AttentionCapture(config)
+        set_attn_capture(self.attn_capture)
 
 
 @dataclass

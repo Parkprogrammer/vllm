@@ -110,10 +110,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None, description="KVTransfer parameters."
     )
 
-    # NOTE(jehyun): For adding kv hook to response
-    kv_hook_data: list[dict[str, Any]] | None = Field(
+    attn_capture_data: list[dict[str, Any]] | None = Field(
         default=None,
-        description="List of KV hook attention data (one per layer)"
+        description="Captured attention scores (one per layer)"
     )
 
 
@@ -334,14 +333,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    # NOTE(jehyun): For adding kv hook to response
-    kv_hook_capture: int | None = Field(
+    attn_capture: int | None = Field(
         default=None,
-        description="Enable KV hook attention capture (1=enable, 0=disable)"
+        description="Enable attention capture (1=enable, 0=disable)"
     )
-    kv_hook_layers: str | None = Field(
+    attn_capture_layers: str | None = Field(
         default=None,
-        description="Comma-separated layer indices for KV hook (e.g., '0,5,11')"
+        description="Comma-separated layer indices to capture (e.g., '0,5,11')"
     )
 
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
@@ -487,11 +485,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
 
-        # NOTE(jehyun): For adding kv hook to response
-        if self.kv_hook_capture is not None:
-            extra_args["kv_hook_capture"] = str(self.kv_hook_capture)
-        if self.kv_hook_layers is not None:
-            extra_args["kv_hook_layers"] = self.kv_hook_layers
+        if self.attn_capture is not None:
+            extra_args["attn_capture"] = str(self.attn_capture)
+        if self.attn_capture_layers is not None:
+            extra_args["attn_capture_layers"] = self.attn_capture_layers
 
         return SamplingParams.from_optional(
             n=self.n,
