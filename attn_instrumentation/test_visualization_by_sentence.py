@@ -174,16 +174,16 @@ def call_vllm_and_save_context(
     }]
     used_model = resolve_model_name(model, api_base, api_key, timeout)
     extra_body = {
-        "kv_hook_capture": DEFAULT_CAPTURE,
-        "kv_hook_layers": str(layer),
+        "attn_capture": DEFAULT_CAPTURE,
+        "attn_capture_layers": str(layer),
     }
     payload = {
         "model": used_model,
         "messages": messages,
         "temperature": 0.0,
         "max_tokens": max_tokens,
-        "kv_hook_capture": DEFAULT_CAPTURE,
-        "kv_hook_layers": str(layer),
+        "attn_capture": DEFAULT_CAPTURE,
+        "attn_capture_layers": str(layer),
     }
     body: dict[str, Any]
     raw_text: str
@@ -1458,7 +1458,7 @@ def select_kv_item(kv_data: list[dict[str, Any]], layer: int) -> dict[str, Any]:
             if isinstance(v, dict) and isinstance(v.get("layer_idx"), int)
         }
     )
-    raise RuntimeError(f"layer {layer} not found in kv_hook_data. available={available}")
+    raise RuntimeError(f"layer {layer} not found in attn_capture_data. available={available}")
 
 
 def main() -> int:
@@ -1496,10 +1496,10 @@ def main() -> int:
             output_dir=out_dir,
         )
 
-    kv = body.get("kv_hook_data") or []
+    kv = body.get("attn_capture_data") or []
     if not kv:
         raise RuntimeError(
-            "kv_hook_data missing "
+            "attn_capture_data missing "
             f"(request_id={body.get('id')}, model={context.get('model', args.model)})"
         )
 

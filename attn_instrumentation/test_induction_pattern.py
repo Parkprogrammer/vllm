@@ -13,8 +13,8 @@ from pathlib import Path
 MODEL = "gemma-3-4b-it"
 API_BASE = "http://127.0.0.1:8000/v1"
 API_KEY = "EMPTY"
-KV_HOOK_CAPTURE = 1
-KV_HOOK_LAYERS = "33"  # Check one layer
+ATTN_CAPTURE = 1
+ATTN_CAPTURE_LAYERS = "33"  # Check one layer
 MAX_TOKENS = 100  # Short generation
 TIMEOUT = 60.0
 
@@ -31,8 +31,8 @@ def call_vllm(prompt: str) -> dict:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,  # Deterministic for clear patterns
         "max_tokens": MAX_TOKENS,
-        "kv_hook_capture": KV_HOOK_CAPTURE,
-        "kv_hook_layers": KV_HOOK_LAYERS,
+        "attn_capture": ATTN_CAPTURE,
+        "attn_capture_layers": ATTN_CAPTURE_LAYERS,
     }
 
     req = urllib.request.Request(
@@ -68,7 +68,7 @@ def main() -> int:
 
     # Extract response
     response_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-    kv_data = body.get("kv_hook_data") or []
+    kv_data = body.get("attn_capture_data") or []
     request_id = body.get("id")
 
     print(f"\nResponse: {response_text}\n", file=sys.stderr)
@@ -86,7 +86,7 @@ def main() -> int:
     context = {
         "mode": "induction_test",
         "model": MODEL,
-        "layer": int(KV_HOOK_LAYERS),
+        "layer": int(ATTN_CAPTURE_LAYERS),
         "prompt_text": INDUCTION_PROMPT,
         "response_text": response_text,
         "request_id": request_id,
@@ -100,12 +100,12 @@ def main() -> int:
         "status": "ok",
         "request_id": request_id,
         "model": MODEL,
-        "layer": int(KV_HOOK_LAYERS),
+        "layer": int(ATTN_CAPTURE_LAYERS),
         "prompt_length": len(INDUCTION_PROMPT),
         "response_length": len(response_text),
         "prompt_tokens": body.get("usage", {}).get("prompt_tokens"),
         "completion_tokens": body.get("usage", {}).get("completion_tokens"),
-        "kv_hook_captured": len(kv_data) > 0,
+        "attn_captured": len(kv_data) > 0,
         "artifact_dir": str(artifact_dir),
     }
 

@@ -109,8 +109,7 @@ def extract_k_from_kv_cache(
     Returns: Tensor of shape [len(slot_ids), num_kv_heads, head_dim]
     """
     shape = kv_cache.shape
-    slot_tensor = torch.tensor(
-        slot_ids, dtype=torch.long, device=kv_cache.device)
+    slot_tensor = torch.tensor(slot_ids, dtype=torch.long, device=kv_cache.device)
 
     if kv_cache.ndim == 5 and shape[0] == 2:
         page_size, num_slots = shape[2], shape[1] * shape[2]
@@ -320,7 +319,6 @@ def _collect_qk_pairs(
         tok_idx.append(si)
     return q_list, q_sids, tok_idx
 
-
 def _filter_compatible_qk(
     tok_idx: list[int],
     q_list: list[torch.Tensor],
@@ -376,16 +374,14 @@ class AttentionCapture:
         """
         if not self.config.enabled or attn_metadata is None: return
 
-        layer_idx = self._extract_layer_idx(layer_name)
+        layer_idx = self.extract_layer_idx(layer_name)
         if layer_idx < 0: return
 
         slot_ids = attn_metadata.slot_mapping
         if query.shape[0] != slot_ids.shape[0]: return
 
-        try:
-            query_cpu = query.detach().cpu().clone()
-        except Exception:
-            return
+        try: query_cpu = query.detach().cpu().clone()
+        except Exception: return
 
         capture_slots = self.capture_slots
         for i in range(query.shape[0]):
@@ -413,75 +409,69 @@ class AttentionCapture:
         Called at request-free time. Computes Q*K attention on GPU
         and writes results to shared memory.
         """
-        req_id = None
-        try:
-            req_id = req_state.req_id
-            layers = resolve_target_layers(req_state, self.config.layers)
-            snapshots: list[dict] = []
+        req_id = req_state.req_id
+        layers = resolve_target_layers(req_state, self.config.layers)
+        snapshots: list[dict] = []
 
-            for layer_idx in layers:
-                # Find matching block group
-                buf_slots = [sid for (li, sid) in self.q_buffer if li == layer_idx]
-                if not buf_slots or not req_state.block_ids: continue
+        for layer_idx in layers:
+            # Find matching block group
+            buf_slots = [sid for (li, sid) in self.q_buffer if li == layer_idx]
+            if not buf_slots or not req_state.block_ids: continue
 
-                buf_set, grp_idx = set(buf_slots), None
-                for gi, block_list in enumerate(req_state.block_ids):
-                    if not block_list: continue
-                    if buf_set & slots_from_blocks(block_list, block_size):
-                        grp_idx = gi
-                        break
-                if grp_idx is None: continue
+            buf_set, grp_idx = set(buf_slots), None
+            for gi, block_list in enumerate(req_state.block_ids):
+                if not block_list: continue
+                if buf_set & slots_from_blocks(block_list, block_size):
+                    grp_idx = gi
+                    break
+            if grp_idx is None: continue
 
-                slots = ordered_slots_for_group(
-                    req_state.block_ids[grp_idx],
-                    req_state.num_tokens, block_size)
-                if not slots: continue
+            slots = ordered_slots_for_group(
+                req_state.block_ids[grp_idx],
+                req_state.num_tokens, block_size)
+            if not slots: continue
 
-                # Collect Q/K pairs
-                q_list, q_sids, tok_idx = _collect_qk_pairs(
-                    self.q_buffer, layer_idx, slots)
-                if not q_list: continue
+            # Collect Q/K pairs
+            q_list, q_sids, tok_idx = _collect_qk_pairs(
+                self.q_buffer, layer_idx, slots)
+            if not q_list: continue
 
-                kv_idx = (layer_idx if layer_idx < len(kv_caches) else grp_idx)
-                if (not kv_caches or kv_idx is None
-                        or kv_idx >= len(kv_caches)): continue
-                k_raw = extract_k_from_kv_cache(kv_caches[kv_idx], q_sids)
-                k_list = [k_raw[i] for i in range(k_raw.shape[0])]
-                if not k_list: continue
+            kv_idx = (layer_idx if layer_idx < len(kv_caches) else grp_idx)
+            if (not kv_caches or kv_idx is None
+                    or kv_idx >= len(kv_caches)): continue
+            k_raw = extract_k_from_kv_cache(kv_caches[kv_idx], q_sids)
+            k_list = [k_raw[i] for i in range(k_raw.shape[0])]
+            if not k_list: continue
 
-                tok_idx, q_list, k_list = _filter_compatible_qk(tok_idx, q_list, k_list)
-                if not q_list: continue
+            tok_idx, q_list, k_list = _filter_compatible_qk(tok_idx, q_list, k_list)
+            if not q_list: continue
 
-                # Compute attention
-                q_t, k_t = torch.stack(q_list), torch.stack(k_list)
-                if k_t.is_cuda and not q_t.is_cuda: q_t = q_t.to(k_t.device)
+            # Compute attention
+            q_t, k_t = torch.stack(q_list), torch.stack(k_list)
+            if k_t.is_cuda and not q_t.is_cuda: q_t = q_t.to(k_t.device)
 
-                scale = 1.0 / (q_t.shape[2] ** 0.5)
-                attn = compute_qk_attention(q_t, k_t, scale)
-                if attn is None: continue
+            scale = 1.0 / (q_t.shape[2] ** 0.5)
+            attn = compute_qk_attention(q_t, k_t, scale)
+            if attn is None: continue
 
-                # Apply prefix slice
-                if prefix:
-                    parts = prefix.split(':')
-                    q_start = int(parts[0]) if parts[0] else 0
-                    q_end = (int(parts[1])
-                             if len(parts) > 1 and parts[1] else None)
-                    attn = attn[q_start:q_end, :, :]
-                    tok_idx = tok_idx[q_start:q_end]
+            # Apply prefix slice
+            if prefix:
+                parts = prefix.split(':')
+                q_start = int(parts[0]) if parts[0] else 0
+                q_end = (int(parts[1])
+                         if len(parts) > 1 and parts[1] else None)
+                attn = attn[q_start:q_end, :, :]
+                tok_idx = tok_idx[q_start:q_end]
 
-                tmeta = build_token_meta(req_state, tok_idx, ordered_slots_len=len(slots))
-                snapshots.append(encode_snapshot(attn, layer_idx, tmeta))
+            tmeta = build_token_meta(req_state, tok_idx, ordered_slots_len=len(slots))
+            snapshots.append(encode_snapshot(attn, layer_idx, tmeta))
 
-                # Clean up Q buffer for this layer
-                for sid in set(slots):
-                    self.q_buffer.pop((layer_idx, sid), None)
+            # Clean up Q buffer for this layer
+            for sid in set(slots):
+                self.q_buffer.pop((layer_idx, sid), None)
 
-            if snapshots:
-                _shm_write(req_id, snapshots)
-
-        except Exception:
-            logger.warning(
-                "Capturing attention failed for %s", req_id, exc_info=True)
+        if snapshots:
+            _shm_write(req_id, snapshots)
 
     def cleanup_request_buffers(
         self,
@@ -502,11 +492,10 @@ class AttentionCapture:
         for k in keys:
             del self.q_buffer[k]
 
-    def _extract_layer_idx(self, layer_name: str) -> int:
+    def extract_layer_idx(self, layer_name: str) -> int:
         """Parse layer index from attention layer name, with caching."""
         v = self._layer_idx_cache.get(layer_name)
-        if v is not None:
-            return v
+        if v is not None: return v
 
         for pat in _LAYER_PATTERNS:
             m = pat.search(layer_name)

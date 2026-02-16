@@ -54,6 +54,7 @@ def _build_minimal_runner(req_id: str):
             sampling_params=SimpleNamespace(
                 extra_args={"attn_capture": "1", "attn_capture_prefix": "2:6"}
             ),
+            block_ids=[],
         )
     }
     runner.num_prompt_logprobs = {}
