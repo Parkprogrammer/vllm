@@ -313,7 +313,7 @@ class KVHook:
             
             # NOTE(jehyun): Determine target layers from request or use default
             # This allows per-request layer selection without modifying global config
-            target_layers = self.config.layers  # Default from initialization
+            target_layers = self.config.layers or set()  # Default from initialization
             if req_state.sampling_params and req_state.sampling_params.extra_args:
                 layers_str = req_state.sampling_params.extra_args.get('kv_hook_layers')
                 if layers_str and layers_str.strip().lower() != 'all':

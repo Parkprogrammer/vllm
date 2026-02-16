@@ -916,7 +916,7 @@ class GPUModelRunner(
                     if req_state.sampling_params:
                         extra_args = req_state.sampling_params.extra_args
                         if extra_args:
-                            should_capture = str(extra_args.get('kv_hook_capture', '1')) == '1'
+                            should_capture = str(extra_args.get('kv_hook_capture', '0')) == '1'
                             prefix = extra_args.get('kv_hook_prefix')
 
                     if should_capture:
