@@ -8,15 +8,17 @@ from dataclasses import dataclass
 from bisect import bisect_left
 from typing import Dict, List, Optional, Set, Tuple, Any
 
+import logging
 import re, time, struct, pickle
 import gzip, base64
 import torch
 from multiprocessing import shared_memory
 
+logger = logging.getLogger(__name__)
+
 def _shm_name(req_id: str) -> str:
     """Deterministic shared-memory segment name from request ID."""
     return "/vkv_" + req_id.replace("-", "")[:40]
-
 
 def _shm_write(req_id: str, snapshots: list[dict]) -> None:
     """Write snapshot list to a named shared-memory segment.
@@ -96,7 +98,7 @@ def extract_k_from_kv_cache(
 
     if kv_cache.ndim == 5 and shape[0] == 2:
         # FlashAttention layout: [2(K/V), num_blocks, page_size, ...]
-        page_size, num_slots = shape[2], shape[1] * page_size
+        page_size, num_slots = shape[2], shape[1] * shape[2]
         k_flat = kv_cache[0].reshape(num_slots, -1)          # [total_slots, kv_heads*head_dim]
         k = k_flat[slot_tensor].view(len(slot_ids), shape[3], shape[4])
     elif kv_cache.ndim == 5 and shape[1] == 2:
@@ -176,8 +178,7 @@ class KVHook:
         at request completion time via extract_k_from_kv_cache().
         """
 
-        if not self.config.enabled: return
-        if attn_metadata is None:  return
+        if (not self.config.enabled) or (attn_metadata is None): return
 
         layer_idx = self._extract_layer_idx(layer_name)
         if layer_idx < 0: return
@@ -196,8 +197,7 @@ class KVHook:
             slot_id = slot_ids[i].item()
             if slot_id < 0: continue
             # Only buffer slots belonging to capture-enabled requests
-            if capture_slots is not None and slot_id not in capture_slots:
-                continue
+            if capture_slots is not None and slot_id not in capture_slots: continue
 
             buffer_key = (layer_idx, slot_id)
             if buffer_key not in self.q_buffer: self.q_buffer[buffer_key] = []
@@ -271,18 +271,16 @@ class KVHook:
             "token_idx_basis": "window_local",
             "window_offset_candidate": window_offset,
             "prompt_boundary_local": prompt_boundary_local,
-            "prompt_boundary_with_offset_candidate": prompt_boundary_with_offset,
-        }
+            "prompt_boundary_with_offset_candidate": prompt_boundary_with_offset, }
 
     def _compute_attention(self, q_tensor, k_tensor, scale):
-        q = q_tensor.transpose(0, 1)  # [hq, T, d]
-        k = k_tensor.transpose(0, 1)  # [hk, T, d]
-
+        
+        # [hq, T, d] | [hk, T, d]
+        q, k = q_tensor.transpose(0, 1), k_tensor.transpose(0, 1) 
         hq, Tq, d = q.shape
         hk, Tk, dk = k.shape
 
-        if d != dk or Tq != Tk:
-            return None
+        if d != dk or Tq != Tk: return None
 
         # Always create a mapping index from hk to hq
         if hk == hq:
@@ -292,7 +290,7 @@ class KVHook:
             k_m = k.index_select(0, torch.arange(hq, device=k.device) // (hq // hk))
         else:
             # Fallback: linear resample
-            idx = torch.clamp(
+            idx = torch.clamp( 
                 torch.floor(torch.arange(hq, device=k.device) * (hk / hq)).long(),
                 0, hk - 1)
             k_m = k.index_select(0, idx)
@@ -302,6 +300,45 @@ class KVHook:
         return probs.transpose(0, 1)  # [hq, T, T] -> [T, hq, T]
 
     
+    @staticmethod
+    def _ordered_slots_for_group(
+        block_list: list[int], num_tokens: int, block_size: int,
+    ) -> list[int]:
+        """Build deduplicated, token-order slot list from a block group."""
+        ordered: list[int] = []
+        seen: Set[int] = set()
+        cursor = 0
+        for block_id in block_list:
+            if cursor >= num_tokens: break
+            base = block_id * block_size
+            count = min(block_size, num_tokens - cursor)
+            for off in range(count):
+                slot_id = base + off
+                if slot_id not in seen:
+                    ordered.append(slot_id); seen.add(slot_id)
+            cursor += count
+        return ordered
+
+    @staticmethod
+    def _slots_from_blocks(block_list: list[int], block_size: int) -> Set[int]:
+        """Return the set of all slot IDs covered by the given blocks."""
+        slots: Set[int] = set()
+        for bid in block_list:
+            base = bid * block_size
+            for off in range(block_size):
+                slots.add(base + off)
+        return slots
+
+    @staticmethod
+    def _resolve_target_layers(req_state, default_layers: Set[int] | None) -> Set[int]:
+        """Determine target layers: per-request override or server default."""
+        target = default_layers or set()
+        if req_state.sampling_params and req_state.sampling_params.extra_args:
+            layers_str = req_state.sampling_params.extra_args.get('kv_hook_layers')
+            if layers_str and layers_str.strip().lower() != 'all':
+                target = set(int(x.strip()) for x in layers_str.split(','))
+        return target
+
     def capture_kv_q_attention(self, req_state, block_size: int, kv_caches, prefix: str | None = None) -> None:
         """
          At the timing of freeing request of vllm-engine,
@@ -310,153 +347,93 @@ class KVHook:
         req_id = None
         try:
             req_id = req_state.req_id
-            
-            # NOTE(jehyun): Determine target layers from request or use default
-            # This allows per-request layer selection without modifying global config
-            target_layers = self.config.layers or set()  # Default from initialization
-            if req_state.sampling_params and req_state.sampling_params.extra_args:
-                layers_str = req_state.sampling_params.extra_args.get('kv_hook_layers')
-                if layers_str and layers_str.strip().lower() != 'all':
-                    target_layers = set(int(x.strip()) for x in layers_str.split(','))
+            layers = self._resolve_target_layers(req_state, self.config.layers)
+            snapshots: list[dict] = []
 
-            _req_snapshots: list[dict] = []  # collect per-layer results
+            for layer_idx in layers:
+                buf_slots = [sid for (li, sid) in self.q_buffer if li == layer_idx]
+                if (not buf_slots) or (not req_state.block_ids): continue
 
-            for layer_idx in target_layers:
-                buffer_slots_this_layer = [slot_id for (l_idx, slot_id) in self.q_buffer.keys() if l_idx == layer_idx]
+                # Find which block_ids group overlaps with buffered slots
+                buf_set, grp_idx = set(buf_slots), None
+                for gi, block_list in enumerate(req_state.block_ids):
+                    if not block_list: continue
+                    if buf_set & self._slots_from_blocks(block_list, block_size):
+                        grp_idx = gi
+                        break
+                if grp_idx is None: continue
 
-                if not buffer_slots_this_layer: continue
+                slots = self._ordered_slots_for_group(
+                    req_state.block_ids[grp_idx],
+                    req_state.num_tokens, block_size)
+                if not slots: continue
 
-                # Auto-detect which block_ids group matches THIS request's buffer
-                matching_group_idx, ordered_slots = None, []
-                buffer_slot_set = set(buffer_slots_this_layer)
+                # Collect Q from buffer in deterministic token order
+                q_list, q_sids, tok_idx = [], [], []
+                for si, sid in enumerate(slots):
+                    q_buf = self.q_buffer.get((layer_idx, sid))
+                    if not q_buf: continue
+                    q_list.append(q_buf[0]); q_sids.append(sid)
+                    tok_idx.append(si)
+                if not q_list: continue
 
-                if req_state.block_ids:
-                    # Match by intersection: which group's slots overlap with buffer?
-                    for group_idx, block_list in enumerate(req_state.block_ids):
-                        if not block_list: continue
-                        group_slot_set = set()
-                        for bid in block_list:
-                            for off in range(block_size):
-                                group_slot_set.add(bid * block_size + off)
-                        overlap = len(buffer_slot_set & group_slot_set)
-                        if overlap > 0 and matching_group_idx is None:
-                            matching_group_idx = group_idx
+                # Read K directly from KV cache
+                kv_idx = layer_idx if layer_idx < len(kv_caches) else grp_idx
+                if not kv_caches or kv_idx is None or kv_idx >= len(kv_caches): continue
+                k_raw = extract_k_from_kv_cache(kv_caches[kv_idx], q_sids)
+                k_list = [k_raw[i] for i in range(k_raw.shape[0])]
+                if not k_list: continue
 
-                    if matching_group_idx is not None:
-                        # Compute ordered_slots using ONLY the matched group
-                        matched_blocks = req_state.block_ids[matching_group_idx]
-                        tokens_processed = 0
-                        seen_slots = set()
+                # Filter to compatible Q/K pairs (same shape, device)
+                q0, k0 = q_list[0], k_list[0]
+                triples = [
+                    (idx, q, k) for idx, q, k in zip(tok_idx, q_list, k_list)
+                    if (isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor)
+                        and q.shape == q0.shape and k.shape == k0.shape
+                        and q.device == q0.device and k.device == k0.device) ]
+                if not triples: continue
+                tok_idx, q_list, k_list = (
+                    [t[0] for t in triples], [t[1] for t in triples], [t[2] for t in triples])
 
-                        for block_id in matched_blocks:
-                            if tokens_processed >= req_state.num_tokens: break
+                # Build tensors and compute attention
+                q_t, k_t = torch.stack(q_list), torch.stack(k_list)
+                if k_t.is_cuda and not q_t.is_cuda: q_t = q_t.to(k_t.device)
 
-                            start_slot = block_id * block_size
-                            tokens_in_this_block = min(block_size, req_state.num_tokens - tokens_processed)
-                            for offset in range(tokens_in_this_block):
-                                slot_id = start_slot + offset
-                                if slot_id in seen_slots: continue
-                                ordered_slots.append(slot_id)
-                                seen_slots.add(slot_id)
-                            tokens_processed += tokens_in_this_block
+                scale = 1.0 / (q_t.shape[2] ** 0.5)
+                attn = self._compute_attention(q_t, k_t, scale)
+                if attn is None: continue
 
-                    else:
-                        continue
-                else:
-                    continue
+                # Apply prefix slice if requested
+                if prefix:
+                    parts = prefix.split(':')
+                    q_start = int(parts[0]) if parts[0] else 0
+                    q_end = int(parts[1]) if len(parts) > 1 and parts[1] else None
+                    attn = attn[q_start:q_end, :, :]
+                    tok_idx = tok_idx[q_start:q_end]
 
-                request_slot_set = set(ordered_slots)
-                q_list, k_list = [], []
-                token_idx: list[int] = []
-                q_slot_ids: list[int] = []
+                tmeta = self.build_token_meta(
+                    req_state, tok_idx,
+                    ordered_slots_len=len(slots))
 
-                if not ordered_slots: continue
+                # Encode to wire format
+                attn = attn.cpu()
+                compressed = gzip.compress(attn.numpy().tobytes())
+                snapshots.append({
+                    'data': base64.b64encode(compressed).decode('utf-8'),
+                    'shape': list(attn.shape),
+                    'dtype': str(attn.dtype),
+                    'layer_idx': layer_idx,
+                    'token_meta': tmeta, })
 
-                # Collect Q from buffer in deterministic token order.
-                for slot_idx, slot_id in enumerate(ordered_slots):
-                    q_tokens = self.q_buffer.get((layer_idx, slot_id))
-                    if not q_tokens: continue
-                    q_list.append(q_tokens[0])
-                    q_slot_ids.append(slot_id)
-                    token_idx.append(slot_idx)
+                # Clean up this request's Q slots from buffer
+                for sid in set(slots):
+                    self.q_buffer.pop((layer_idx, sid), None)
 
-                # Read K directly from KV cache (no per-step buffering needed)
-                kv_cache_idx = layer_idx if layer_idx < len(kv_caches) else matching_group_idx
-                if q_list and kv_caches and kv_cache_idx is not None and kv_cache_idx < len(kv_caches):
-                    k_from_cache = extract_k_from_kv_cache(
-                        kv_caches[kv_cache_idx], q_slot_ids
-                    )
-                    k_list = [k_from_cache[i] for i in range(k_from_cache.shape[0])]
-
-                if q_list and k_list:
-
-                    q0, k0 = q_list[0], k_list[0]
-                    triples = []
-                    
-                    for idx, q_tok, k_tok in zip(token_idx, q_list, k_list):
-                        if (isinstance(q_tok, torch.Tensor) and isinstance(k_tok, torch.Tensor)
-                                and q_tok.shape == q0.shape and k_tok.shape == k0.shape
-                                and q_tok.device == q0.device and k_tok.device == k0.device):
-                            triples.append((idx, q_tok, k_tok))
-                    if not triples: continue
-                    
-                    token_idx, q_list, k_list = [t[0] for t in triples], [t[1] for t in triples], \
-                                                        [t[2] for t in triples]
-
-                    min_len = min(len(q_list), len(k_list))
-                    if min_len == 0: continue
-                        
-                    # [T, H, D]
-                    q_tensor, k_tensor = torch.stack(q_list[:min_len]), torch.stack(k_list[:min_len])
-
-                    # Move Q to GPU for fast bmm (K is already on GPU from KV cache)
-                    if k_tensor.is_cuda and not q_tensor.is_cuda:
-                        q_tensor = q_tensor.to(k_tensor.device)
-
-                    # calculate attention
-                    # support: GQA, Vanilla Attention
-                    # need testing: Sliding-Window, Multi-Modal(Encoder) mixed, permutation
-                    head_dim = q_tensor.shape[2]
-                    scale = 1.0 / (head_dim ** 0.5)
-                    attn_scores = self._compute_attention(q_tensor, k_tensor, scale)
-
-                    if attn_scores is None: continue
-                    
-                    # Can this prefix work?
-                    if prefix:
-                        parts = prefix.split(':')
-                        q_start = int(parts[0]) if parts[0] else 0
-                        q_end = int(parts[1]) if len(parts) > 1 and parts[1] else None
-                        attn_scores = attn_scores[q_start:q_end, :, :]
-                        token_idx = token_idx[q_start:q_end]
-
-                    token_meta = self.build_token_meta(
-                        req_state,
-                        token_idx,
-                        ordered_slots_len=len(ordered_slots), )
-
-                    # Encode to wire format and collect for shared memory
-                    attn_scores = attn_scores.cpu()
-                    compressed = gzip.compress(attn_scores.numpy().tobytes())
-                    _req_snapshots.append({
-                        'data': base64.b64encode(compressed).decode('utf-8'),
-                        'shape': list(attn_scores.shape),
-                        'dtype': str(attn_scores.dtype),
-                        'layer_idx': layer_idx,
-                        'token_meta': token_meta,
-                    })
-
-                    # Clean up this request's Q slots from buffer
-                    for slot_id in request_slot_set:
-                        self.q_buffer.pop((layer_idx, slot_id), None)
-
-            # Write all collected layer snapshots to shared memory at once
-            if _req_snapshots:
-                _shm_write(req_id, _req_snapshots)
+            if snapshots: 
+                _shm_write(req_id, snapshots)
 
         except Exception:
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Capturing attention failed for %s", req_id, exc_info=True)
 
     def cleanup_request_buffers(
@@ -468,15 +445,12 @@ class KVHook:
         to prevent stale Q data from leaking into future requests that reuse
         the same KV cache blocks.
         """
-        if not self.q_buffer or not block_ids:
-            return
+        if not self.q_buffer or not block_ids: return
         slots_to_remove: Set[int] = set()
         for block_list in block_ids:
-            for bid in block_list:
-                for off in range(block_size):
-                    slots_to_remove.add(bid * block_size + off)
+            slots_to_remove |= self._slots_from_blocks(block_list, block_size)
         keys_to_remove = [k for k in self.q_buffer if k[1] in slots_to_remove]
-        for k in keys_to_remove:
+        for k in keys_to_remove: 
             del self.q_buffer[k]
 
     def _extract_layer_idx(self, layer_name: str) -> int:
