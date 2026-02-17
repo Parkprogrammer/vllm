@@ -381,7 +381,11 @@ def compute_qk_attention(
             0, hk - 1)
         k_m = k.index_select(0, idx)
 
-    scores = torch.bmm(q, k_m.transpose(-2, -1)) * scale
+    scores = torch.bmm(q, k_m.transpose(-2, -1)) * scale  # [hq, T, T]
+    # Causal mask: token t may only attend to tokens 0..t, matching the actual
+    # FlashAttention computation that was run during inference.
+    causal_mask = torch.ones(Tq, Tq, device=scores.device, dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal_mask, float('-inf'))
     probs = torch.softmax(scores, dim=-1)
     return probs.transpose(0, 1)  # [T, hq, T]
 
