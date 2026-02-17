@@ -3365,31 +3365,9 @@ class GPUModelRunner(
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
-            # NOTE(jehyun): Build per-request capture_slots so buffer_query
-            # only stores Q for capture-enabled requests.
+            # NOTE(jehyun): Capturing attentions for requested queries
             if self.attn_capture:
-                capture_slots: set[int] | None = None
-                block_size = self.cache_config.block_size
-                for req_id in self.input_batch.req_ids:
-                    req_state = self.requests.get(req_id)
-                    if not req_state: continue
-                    
-                    extra_args = getattr(
-                        req_state.sampling_params, 'extra_args', None
-                    ) or {}
-                    if str(extra_args.get('attn_capture', '0')) != '1':
-                        continue
-                    
-                    from vllm.model_executor.layers.attention.attn_capture import (
-                        slots_from_blocks)
-                    if capture_slots is None:
-                        capture_slots = set()
-                    for block_list in req_state.block_ids:
-                        capture_slots.update(
-                            slots_from_blocks(block_list, block_size))
-                self.attn_capture.runtime_enabled_this_step = (
-                    capture_slots is not None)
-                self.attn_capture.capture_slots = capture_slots
+                self._update_attn_capture_slots()
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -6313,6 +6291,25 @@ class GPUModelRunner(
 
         self.attn_capture = AttentionCapture(config)
         set_attn_capture(self.attn_capture)
+
+    def _update_attn_capture_slots(self) -> None:
+        """Update capture_slots to the union of slots for all capture-enabled
+        requests in the current batch. Called once per execute step."""
+        from vllm.model_executor.layers.attention.attn_capture import slots_from_blocks
+
+        block_size = self.cache_config.block_size
+        capture_slots: set[int] | None = None
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            if not req_state: continue
+            extra_args = getattr(req_state.sampling_params, 'extra_args', None) or {}
+            if str(extra_args.get('attn_capture', '0')) != '1': continue
+            if capture_slots is None: capture_slots = set()
+            for block_list in req_state.block_ids:
+                capture_slots.update(slots_from_blocks(block_list, block_size))
+
+        self.attn_capture.runtime_enabled_this_step = capture_slots is not None
+        self.attn_capture.capture_slots = capture_slots
 
     def _capture_finished_request(self, req_id: str) -> None:
         """Capture attention and clean up buffers for a finished request."""

@@ -165,10 +165,10 @@ def main():
                 isinstance(v, int) for v in token_idx
             ):
             diagnostics["prompt_len"] = token_meta.get("prompt_len")
-            diagnostics["offset_candidate"] = token_meta.get("window_offset_candidate")
-            diagnostics["boundary_local"] = token_meta.get("prompt_boundary_local")
+            diagnostics["offset_candidate"] = token_meta.get("win_offset")
+            diagnostics["boundary_local"] = token_meta.get("pb_local")
             diagnostics["boundary_with_offset_candidate"] = token_meta.get(
-                "prompt_boundary_with_offset_candidate"
+                "pb_offset"
             )
 
     out = {

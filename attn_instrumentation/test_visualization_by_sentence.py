@@ -279,7 +279,7 @@ def resolve_token_indices(
         raise ValueError("token_meta.token_idx must be a list[int]")
 
     basis = token_meta.get("token_idx_basis")
-    offset = token_meta.get("window_offset_candidate")
+    offset = token_meta.get("win_offset")
     offset_used = offset if isinstance(offset, int) and basis == "window_local" else None
     if offset_used is not None:
         token_idx_abs = [int(i) + int(offset_used) for i in token_idx_local]

@@ -73,11 +73,11 @@ def main() -> int:
         token_meta = kv_data[0].get("token_meta", {})
         result.update({
             "token_idx_basis": token_meta.get("token_idx_basis"),
-            "window_offset": token_meta.get("window_offset_candidate"),
+            "window_offset": token_meta.get("win_offset"),
             "prompt_len": token_meta.get("prompt_len"),
             "total_len": token_meta.get("total_len"),
             "vision_ranges": token_meta.get("vision_ranges"),
-            "language_ranges": token_meta.get("language_ranges"),
+            "lang_ranges": token_meta.get("lang_ranges"),
         })
 
     print(json.dumps(result, ensure_ascii=False, indent=2))

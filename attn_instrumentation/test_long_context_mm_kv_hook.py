@@ -245,11 +245,11 @@ def main() -> int:
         raw_boundary = int(np.searchsorted(np.asarray(token_idx), prompt_len, side="left")) if isinstance(prompt_len, int) else None
         sorted_idx = np.asarray(token_idx, dtype=np.int64)[order]
         idx_boundary = int(np.searchsorted(sorted_idx, prompt_len, side="left")) if isinstance(prompt_len, int) else None
-        boundary_local = token_meta.get("prompt_boundary_local")
+        boundary_local = token_meta.get("pb_local")
         boundary_with_offset_candidate = token_meta.get(
-            "prompt_boundary_with_offset_candidate"
+            "pb_offset"
         )
-        offset_candidate = token_meta.get("window_offset_candidate")
+        offset_candidate = token_meta.get("win_offset")
         token_index_basis = token_meta.get("token_idx_basis")
         if not isinstance(boundary_local, int) and isinstance(prompt_len, int):
             boundary_local = raw_boundary
